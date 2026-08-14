@@ -1,11 +1,21 @@
 use futures_util::future::join_all;
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    thread,
+};
 
 use relm4::{Component, ComponentParts, ComponentSender, RelmWidgetExt, adw, adw::prelude::*, gtk};
 
 use crate::{
-    stages::identify::{IdentifiedSource, identify_source},
+    profile::{LaunchProfile, PrefixArch, ProfileError, ProfileStore, StoredProfile, data_root},
+    stages::{
+        identify::{IdentifiedSource, SourceKind, identify_source},
+        install::{
+            InstallError, InstallOutcome, InstallRequest, PreparedInstall, PreparedInstallSource,
+            RuntimeCommands, execute_install, inspect_install_source, prepare_install_source,
+        },
+    },
     vndb::{VnSummary, VndbClient, VndbError},
 };
 
@@ -25,12 +35,21 @@ pub struct App {
     games_grid: gtk::FlowBox,
     query_entry: gtk::Entry,
     results_list: gtk::ListBox,
+    wizard: Option<InstallWizard>,
+    profile_store: Option<ProfileStore>,
+    data_root: Option<PathBuf>,
+    wizard_title_entry: gtk::Entry,
+    wizard_arch_dropdown: gtk::DropDown,
+    wizard_disc_dropdown: gtk::DropDown,
+    wizard_installer_dropdown: gtk::DropDown,
+    wizard_executable_dropdown: gtk::DropDown,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Page {
     Library,
     Search,
+    Install,
 }
 
 impl Page {
@@ -38,6 +57,7 @@ impl Page {
         match self {
             Self::Library => "library",
             Self::Search => "search",
+            Self::Install => "install",
         }
     }
 
@@ -45,6 +65,7 @@ impl Page {
         match self {
             Self::Library => "Library",
             Self::Search => "Search VNDB",
+            Self::Install => "Install game",
         }
     }
 }
@@ -58,8 +79,32 @@ struct LibraryGame {
 
 #[derive(Clone, Debug)]
 enum GameOrigin {
-    Local(IdentifiedSource),
+    Installed(LaunchProfile),
     Vndb(VnSummary),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WizardPhase {
+    Review,
+    Preparing,
+    ChooseDisc,
+    Inspecting,
+    ChooseInstaller,
+    Installing,
+    ChooseExecutable,
+    Saving,
+}
+
+#[derive(Clone, Debug)]
+struct InstallWizard {
+    source: IdentifiedSource,
+    title: String,
+    phase: WizardPhase,
+    prepared_source: Option<PreparedInstallSource>,
+    prepared: Option<PreparedInstall>,
+    outcome: Option<InstallOutcome>,
+    selected_executable: Option<PathBuf>,
+    error: Option<String>,
 }
 
 #[derive(Debug)]
@@ -68,6 +113,23 @@ pub enum AppMsg {
     ChooseSourceFile,
     ChooseSourceFolder,
     SourceSelected(PathBuf),
+    WizardTitleChanged(String),
+    WizardPrimary,
+    WizardBrowseExecutable,
+    WizardExecutableSelected(PathBuf),
+    SourcePrepared(Result<PreparedInstallSource, InstallError>),
+    SourceInspected {
+        original: PreparedInstallSource,
+        result: Result<PreparedInstall, InstallError>,
+    },
+    InstallationFinished {
+        prepared: PreparedInstall,
+        result: Result<InstallOutcome, InstallError>,
+    },
+    ProfileSaved {
+        outcome: InstallOutcome,
+        result: Result<StoredProfile, ProfileError>,
+    },
     ShowSearch,
     QueryChanged(String),
     SearchVndb,
@@ -130,9 +192,12 @@ impl Component for App {
                 adw::HeaderBar {
                     pack_start = &gtk::Button {
                         set_icon_name: "go-previous-symbolic",
-                        set_tooltip_text: Some("Back to library"),
                         #[watch]
-                        set_visible: model.page == Page::Search,
+                        set_tooltip_text: Some(model.back_tooltip()),
+                        #[watch]
+                        set_visible: model.page != Page::Library,
+                        #[watch]
+                        set_sensitive: model.can_leave_page(),
                         connect_clicked => AppMsg::ShowLibrary,
                     },
 
@@ -157,7 +222,7 @@ impl Component for App {
                                 set_margin_all: 6,
 
                                 gtk::Button {
-                                    set_label: "Archive or folder",
+                                    set_label: "Install from files",
                                     add_css_class: "flat",
                                     connect_clicked => AppMsg::AddLocal,
                                 },
@@ -184,6 +249,7 @@ impl Component for App {
             set_transition_duration: 150,
             add_named: (&library_page, Some("library")),
             add_named: (&search_page, Some("search")),
+            add_named: (&install_page, Some("install")),
             #[watch]
             set_visible_child_name: model.page.name(),
         },
@@ -200,7 +266,7 @@ impl Component for App {
                 adw::StatusPage {
                     set_icon_name: Some("folder-documents-symbolic"),
                     set_title: "No games yet",
-                    set_description: Some("Press + to add an archive, a folder, or a VNDB title."),
+                    set_description: Some("Press + to install from local files or add a VNDB title."),
                     #[watch]
                     set_visible: model.games.is_empty(),
                 },
@@ -282,6 +348,175 @@ impl Component for App {
                 },
             },
         },
+
+        install_page = &gtk::ScrolledWindow {
+            set_hscrollbar_policy: gtk::PolicyType::Never,
+
+            #[wrap(Some)]
+            set_child = &adw::Clamp {
+                set_hexpand: true,
+                set_maximum_size: 720,
+                set_tightening_threshold: 520,
+
+                #[wrap(Some)]
+                set_child = &gtk::Box {
+                    set_orientation: gtk::Orientation::Vertical,
+                    set_spacing: 18,
+                    set_margin_all: 32,
+
+                    gtk::Label {
+                        set_label: "Install a visual novel",
+                        set_xalign: 0.0,
+                        add_css_class: "title-1",
+                    },
+
+                    gtk::Label {
+                        #[watch]
+                        set_label: &model.wizard_status_text(),
+                        set_xalign: 0.0,
+                        set_wrap: true,
+                        add_css_class: "dim-label",
+                    },
+
+                    gtk::Separator {},
+
+                    gtk::Label {
+                        set_label: "Source",
+                        set_xalign: 0.0,
+                        add_css_class: "heading",
+                    },
+
+                    gtk::Label {
+                        #[watch]
+                        set_label: &model.wizard_source_text(),
+                        set_xalign: 0.0,
+                        set_wrap: true,
+                        set_selectable: true,
+                    },
+
+                    gtk::Box {
+                        set_orientation: gtk::Orientation::Vertical,
+                        set_spacing: 8,
+                        #[watch]
+                        set_visible: model.wizard_phase_is(WizardPhase::Review),
+
+                        gtk::Label {
+                            set_label: "Game title",
+                            set_xalign: 0.0,
+                            add_css_class: "heading",
+                        },
+
+                        append: &model.wizard_title_entry,
+
+                        gtk::Label {
+                            set_label: "Wine prefix",
+                            set_xalign: 0.0,
+                            add_css_class: "heading",
+                        },
+
+                        append: &model.wizard_arch_dropdown,
+
+                        gtk::Label {
+                            set_label: "The WoW64 prefix runs both 32-bit and 64-bit games. A private ja_JP.UTF-8 locale is generated when the system does not provide one.",
+                            set_xalign: 0.0,
+                            set_wrap: true,
+                            add_css_class: "dim-label",
+                        },
+                    },
+
+                    gtk::Box {
+                        set_orientation: gtk::Orientation::Vertical,
+                        set_spacing: 8,
+                        #[watch]
+                        set_visible: model.wizard_phase_is(WizardPhase::ChooseDisc),
+
+                        gtk::Label {
+                            set_label: "Choose disc",
+                            set_xalign: 0.0,
+                            add_css_class: "heading",
+                        },
+
+                        append: &model.wizard_disc_dropdown,
+                    },
+
+                    gtk::Box {
+                        set_orientation: gtk::Orientation::Vertical,
+                        set_spacing: 8,
+                        #[watch]
+                        set_visible: model.wizard_phase_is(WizardPhase::ChooseInstaller),
+
+                        gtk::Label {
+                            set_label: "Choose installer",
+                            set_xalign: 0.0,
+                            add_css_class: "heading",
+                        },
+
+                        append: &model.wizard_installer_dropdown,
+                    },
+
+                    gtk::Box {
+                        set_orientation: gtk::Orientation::Vertical,
+                        set_spacing: 8,
+                        #[watch]
+                        set_visible: model.wizard_phase_is(WizardPhase::ChooseExecutable),
+
+                        gtk::Label {
+                            set_label: "Installed program",
+                            set_xalign: 0.0,
+                            add_css_class: "heading",
+                        },
+
+                        append: &model.wizard_executable_dropdown,
+
+                        gtk::Button {
+                            set_label: "Choose another executable…",
+                            set_halign: gtk::Align::Start,
+                            connect_clicked => AppMsg::WizardBrowseExecutable,
+                        },
+
+                        gtk::Label {
+                            #[watch]
+                            set_label: &model.wizard_selected_executable_text(),
+                            #[watch]
+                            set_visible: model.wizard_has_manual_executable(),
+                            set_xalign: 0.0,
+                            set_wrap: true,
+                            set_selectable: true,
+                            add_css_class: "dim-label",
+                        },
+                    },
+
+                    gtk::Label {
+                        #[watch]
+                        set_label: &model.wizard_error_text(),
+                        #[watch]
+                        set_visible: model.wizard_has_error(),
+                        set_xalign: 0.0,
+                        set_wrap: true,
+                        set_selectable: true,
+                        add_css_class: "error",
+                    },
+
+                    gtk::Spinner {
+                        #[watch]
+                        set_spinning: model.wizard_is_busy(),
+                        #[watch]
+                        set_visible: model.wizard_is_busy(),
+                        set_halign: gtk::Align::Start,
+                    },
+
+                    gtk::Button {
+                        #[watch]
+                        set_label: model.wizard_primary_label(),
+                        #[watch]
+                        set_sensitive: model.wizard_can_continue(),
+                        set_halign: gtk::Align::End,
+                        add_css_class: "suggested-action",
+                        connect_clicked => AppMsg::WizardPrimary,
+                    },
+                },
+            },
+        },
     }
 
     fn init(
@@ -317,10 +552,55 @@ impl Component for App {
         results_list.add_css_class("boxed-list");
         results_list.set_visible(false);
 
+        let wizard_title_entry = gtk::Entry::new();
+        wizard_title_entry.set_hexpand(true);
+        let title_sender = sender.clone();
+        wizard_title_entry.connect_changed(move |entry| {
+            title_sender.input(AppMsg::WizardTitleChanged(entry.text().to_string()));
+        });
+        let primary_sender = sender.clone();
+        wizard_title_entry.connect_activate(move |_| {
+            primary_sender.input(AppMsg::WizardPrimary);
+        });
+
+        let wizard_arch_dropdown = gtk::DropDown::from_strings(&[
+            "64-bit WoW64 prefix (recommended)",
+            "32-bit-only prefix (legacy Wine builds)",
+        ]);
+        let wizard_disc_dropdown = gtk::DropDown::from_strings(&[]);
+        wizard_disc_dropdown.set_enable_search(true);
+        let wizard_installer_dropdown = gtk::DropDown::from_strings(&[]);
+        wizard_installer_dropdown.set_enable_search(true);
+        let wizard_executable_dropdown = gtk::DropDown::from_strings(&[]);
+        wizard_executable_dropdown.set_enable_search(true);
+
+        let (application_data_root, profile_store, games, library_error) = match data_root() {
+            Ok(root) => {
+                let store = ProfileStore::new(&root);
+                match store.load() {
+                    Ok(profiles) => (
+                        Some(root),
+                        Some(store),
+                        profiles
+                            .into_iter()
+                            .map(|stored| LibraryGame {
+                                title: stored.title,
+                                origin: GameOrigin::Installed(stored.profile),
+                                thumbnail: None,
+                            })
+                            .collect(),
+                        None,
+                    ),
+                    Err(error) => (Some(root), Some(store), Vec::new(), Some(error.to_string())),
+                }
+            }
+            Err(error) => (None, None, Vec::new(), Some(error.to_string())),
+        };
+
         let model = Self {
             page: Page::Library,
-            games: Vec::new(),
-            library_error: None,
+            games,
+            library_error,
             query: String::new(),
             search: SearchState::Idle,
             vndb: VndbClient::new(),
@@ -328,7 +608,16 @@ impl Component for App {
             games_grid,
             query_entry,
             results_list,
+            wizard: None,
+            profile_store,
+            data_root: application_data_root,
+            wizard_title_entry,
+            wizard_arch_dropdown,
+            wizard_disc_dropdown,
+            wizard_installer_dropdown,
+            wizard_executable_dropdown,
         };
+        model.refresh_games_list();
         let widgets = view_output!();
 
         ComponentParts { model, widgets }
@@ -346,7 +635,37 @@ impl Component for App {
                 show_source_chooser(root, sender, gtk::FileChooserAction::SelectFolder);
             }
             AppMsg::SourceSelected(path) => {
-                self.add_local_source(path);
+                self.open_install_wizard(path);
+            }
+            AppMsg::WizardTitleChanged(title) => {
+                if let Some(wizard) = &mut self.wizard {
+                    wizard.title = title;
+                    wizard.error = None;
+                }
+            }
+            AppMsg::WizardPrimary => {
+                self.advance_wizard(sender);
+            }
+            AppMsg::WizardBrowseExecutable => {
+                self.show_executable_chooser(root, sender);
+            }
+            AppMsg::WizardExecutableSelected(path) => {
+                if let Some(wizard) = &mut self.wizard {
+                    wizard.selected_executable = Some(path);
+                    wizard.error = None;
+                }
+            }
+            AppMsg::SourcePrepared(result) => {
+                self.source_prepared(result, sender);
+            }
+            AppMsg::SourceInspected { original, result } => {
+                self.source_inspected(original, result, sender);
+            }
+            AppMsg::InstallationFinished { prepared, result } => {
+                self.installation_finished(prepared, result);
+            }
+            AppMsg::ProfileSaved { outcome, result } => {
+                self.profile_saved(outcome, result);
             }
             AppMsg::ShowSearch => {
                 self.show_search();
@@ -406,7 +725,9 @@ impl App {
 
     fn search_text(&self) -> String {
         match &self.search {
-            SearchState::Idle => "Enter a title. Choosing a result adds it without installing files.".to_owned(),
+            SearchState::Idle => {
+                "Enter a title. Choosing a result adds it without installing files.".to_owned()
+            }
             SearchState::Loading { query } => format!("Searching for “{query}”…"),
             SearchState::Loaded {
                 query, count: 0, ..
@@ -428,24 +749,470 @@ impl App {
         }
     }
 
-    fn add_local_source(&mut self, path: PathBuf) {
+    fn back_tooltip(&self) -> &'static str {
+        match self.page {
+            Page::Install => "Cancel installation",
+            _ => "Back to library",
+        }
+    }
+
+    fn can_leave_page(&self) -> bool {
+        self.page != Page::Install || !self.wizard_is_busy()
+    }
+
+    fn wizard_phase_is(&self, phase: WizardPhase) -> bool {
+        self.wizard
+            .as_ref()
+            .is_some_and(|wizard| wizard.phase == phase)
+    }
+
+    fn wizard_is_busy(&self) -> bool {
+        self.wizard.as_ref().is_some_and(|wizard| {
+            matches!(
+                wizard.phase,
+                WizardPhase::Preparing
+                    | WizardPhase::Inspecting
+                    | WizardPhase::Installing
+                    | WizardPhase::Saving
+            )
+        })
+    }
+
+    fn wizard_status_text(&self) -> String {
+        let Some(wizard) = &self.wizard else {
+            return String::new();
+        };
+        match wizard.phase {
+            WizardPhase::Review => {
+                "Review the source and prefix settings before files are changed.".to_owned()
+            }
+            WizardPhase::Preparing => {
+                "Preparing the source. Archives and disc images can take several minutes.".to_owned()
+            }
+            WizardPhase::ChooseDisc => {
+                "Multiple disc images were found. Choose the installer disc to continue.".to_owned()
+            }
+            WizardPhase::Inspecting => "Inspecting the selected installation media.".to_owned(),
+            WizardPhase::ChooseInstaller => {
+                "Multiple setup programs were found. Choose the one to run.".to_owned()
+            }
+            WizardPhase::Installing => {
+                "The installer is running under Wine. Complete it in the installer window.".to_owned()
+            }
+            WizardPhase::ChooseExecutable if wizard.outcome.as_ref().is_some_and(|outcome| outcome.executables.is_empty()) => {
+                "The installer finished, but no new game executable was detected. Choose it under drive_c.".to_owned()
+            }
+            WizardPhase::ChooseExecutable => {
+                "Choose the installed game executable that the library should launch.".to_owned()
+            }
+            WizardPhase::Saving => "Saving the launch profile.".to_owned(),
+        }
+    }
+
+    fn wizard_source_text(&self) -> String {
+        self.wizard
+            .as_ref()
+            .map(|wizard| format!("{}\n{}", wizard.source.kind, wizard.source.path.display()))
+            .unwrap_or_default()
+    }
+
+    fn wizard_primary_label(&self) -> &'static str {
+        match self.wizard.as_ref().map(|wizard| wizard.phase) {
+            Some(WizardPhase::Review) => "Prepare installation",
+            Some(WizardPhase::ChooseDisc) => "Use selected disc",
+            Some(WizardPhase::ChooseInstaller) => "Run selected installer",
+            Some(WizardPhase::ChooseExecutable) => "Save launch profile",
+            _ => "Working…",
+        }
+    }
+
+    fn wizard_can_continue(&self) -> bool {
+        let Some(wizard) = &self.wizard else {
+            return false;
+        };
+        match wizard.phase {
+            WizardPhase::Review => {
+                !wizard.title.trim().is_empty()
+                    && wizard.source.kind != SourceKind::OtherFile
+                    && self.data_root.is_some()
+                    && self.profile_store.is_some()
+            }
+            WizardPhase::ChooseDisc => wizard
+                .prepared_source
+                .as_ref()
+                .is_some_and(|prepared| !prepared.source.disc_images.is_empty()),
+            WizardPhase::ChooseInstaller => wizard
+                .prepared
+                .as_ref()
+                .is_some_and(|prepared| !prepared.installers.is_empty()),
+            WizardPhase::ChooseExecutable => {
+                wizard.selected_executable.is_some()
+                    || wizard
+                        .outcome
+                        .as_ref()
+                        .is_some_and(|outcome| !outcome.executables.is_empty())
+            }
+            _ => false,
+        }
+    }
+
+    fn wizard_has_error(&self) -> bool {
+        self.wizard
+            .as_ref()
+            .is_some_and(|wizard| wizard.error.is_some())
+    }
+
+    fn wizard_error_text(&self) -> String {
+        self.wizard
+            .as_ref()
+            .and_then(|wizard| wizard.error.clone())
+            .unwrap_or_default()
+    }
+
+    fn wizard_has_manual_executable(&self) -> bool {
+        self.wizard
+            .as_ref()
+            .is_some_and(|wizard| wizard.selected_executable.is_some())
+    }
+
+    fn wizard_selected_executable_text(&self) -> String {
+        self.wizard
+            .as_ref()
+            .and_then(|wizard| wizard.selected_executable.as_ref())
+            .map(|path| format!("Selected: {}", path.display()))
+            .unwrap_or_default()
+    }
+
+    fn open_install_wizard(&mut self, path: PathBuf) {
         match identify_source(path) {
             Ok(source) => {
                 let title = fallback_title(&source);
-                self.games.push(LibraryGame {
-                    title,
-                    origin: GameOrigin::Local(source),
-                    thumbnail: None,
+                let error = if source.kind == SourceKind::OtherFile {
+                    Some("Choose a .7z, .rar, .zip, .iso, .mds, .exe, or a folder.".to_owned())
+                } else if self.data_root.is_none() || self.profile_store.is_none() {
+                    Some(
+                        "The application data directory is unavailable, so a profile cannot be saved."
+                            .to_owned(),
+                    )
+                } else {
+                    None
+                };
+                self.wizard = Some(InstallWizard {
+                    source,
+                    title: title.clone(),
+                    phase: WizardPhase::Review,
+                    prepared_source: None,
+                    prepared: None,
+                    outcome: None,
+                    selected_executable: None,
+                    error,
                 });
+                self.wizard_title_entry.set_text(&title);
+                self.wizard_arch_dropdown.set_selected(0);
+                set_path_choices(&self.wizard_disc_dropdown, &[]);
+                set_path_choices(&self.wizard_installer_dropdown, &[]);
+                set_path_choices(&self.wizard_executable_dropdown, &[]);
                 self.library_error = None;
-                self.refresh_games_list();
-                self.show_library();
+                self.page = Page::Install;
             }
             Err(error) => {
                 self.library_error = Some(error.to_string());
-                self.show_library();
+                self.page = Page::Library;
             }
         }
+    }
+
+    fn advance_wizard(&mut self, sender: ComponentSender<App>) {
+        let Some(phase) = self.wizard.as_ref().map(|wizard| wizard.phase) else {
+            return;
+        };
+        match phase {
+            WizardPhase::Review => self.start_preparing_source(sender),
+            WizardPhase::ChooseDisc => {
+                let Some(prepared) = self
+                    .wizard
+                    .as_mut()
+                    .and_then(|wizard| wizard.prepared_source.take())
+                else {
+                    return;
+                };
+                let selected =
+                    selected_path(&prepared.source.disc_images, &self.wizard_disc_dropdown);
+                self.start_inspecting_source(prepared, selected, sender);
+            }
+            WizardPhase::ChooseInstaller => {
+                let Some(prepared) = self
+                    .wizard
+                    .as_mut()
+                    .and_then(|wizard| wizard.prepared.take())
+                else {
+                    return;
+                };
+                let Some(installer) =
+                    selected_path(&prepared.installers, &self.wizard_installer_dropdown)
+                else {
+                    if let Some(wizard) = &mut self.wizard {
+                        wizard.prepared = Some(prepared);
+                        wizard.error = Some("Choose an installer to continue.".to_owned());
+                    }
+                    return;
+                };
+                self.start_installer(prepared, installer, sender);
+            }
+            WizardPhase::ChooseExecutable => self.start_saving_profile(sender),
+            _ => {}
+        }
+    }
+
+    fn start_preparing_source(&mut self, sender: ComponentSender<App>) {
+        let Some(wizard) = &mut self.wizard else {
+            return;
+        };
+        let Some(data_root) = self.data_root.clone() else {
+            wizard.error = Some("The application data directory is unavailable.".to_owned());
+            return;
+        };
+        if wizard.title.trim().is_empty() {
+            wizard.error = Some("Enter a game title.".to_owned());
+            return;
+        }
+        if let Some(prepared) = wizard.prepared_source.take() {
+            prepared.discard();
+        }
+        if let Some(prepared) = wizard.prepared.take() {
+            prepared.discard();
+        }
+        let request = InstallRequest {
+            title: wizard.title.trim().to_owned(),
+            source: wizard.source.clone(),
+            arch: if self.wizard_arch_dropdown.selected() == 1 {
+                PrefixArch::Win32
+            } else {
+                PrefixArch::Win64
+            },
+            locale: "ja_JP.UTF-8".to_owned(),
+            data_root,
+            commands: RuntimeCommands::default(),
+        };
+        wizard.phase = WizardPhase::Preparing;
+        wizard.error = None;
+
+        thread::spawn(move || {
+            let result = prepare_install_source(request);
+            sender.input(AppMsg::SourcePrepared(result));
+        });
+    }
+
+    fn source_prepared(
+        &mut self,
+        result: Result<PreparedInstallSource, InstallError>,
+        sender: ComponentSender<App>,
+    ) {
+        match result {
+            Ok(prepared) if prepared.source.disc_images.len() > 1 => {
+                set_path_choices(&self.wizard_disc_dropdown, &prepared.source.disc_images);
+                if let Some(wizard) = &mut self.wizard {
+                    wizard.phase = WizardPhase::ChooseDisc;
+                    wizard.prepared_source = Some(prepared);
+                }
+            }
+            Ok(prepared) => {
+                let selected = prepared.source.disc_images.first().cloned();
+                self.start_inspecting_source(prepared, selected, sender);
+            }
+            Err(error) => {
+                if let Some(wizard) = &mut self.wizard {
+                    wizard.phase = WizardPhase::Review;
+                    wizard.error = Some(error.to_string());
+                }
+            }
+        }
+    }
+
+    fn start_inspecting_source(
+        &mut self,
+        prepared: PreparedInstallSource,
+        selected_disc: Option<PathBuf>,
+        sender: ComponentSender<App>,
+    ) {
+        if let Some(wizard) = &mut self.wizard {
+            wizard.phase = WizardPhase::Inspecting;
+            wizard.prepared_source = None;
+            wizard.error = None;
+        }
+        thread::spawn(move || {
+            let original = prepared.clone();
+            let result = inspect_install_source(prepared, selected_disc);
+            sender.input(AppMsg::SourceInspected { original, result });
+        });
+    }
+
+    fn source_inspected(
+        &mut self,
+        original: PreparedInstallSource,
+        result: Result<PreparedInstall, InstallError>,
+        sender: ComponentSender<App>,
+    ) {
+        match result {
+            Ok(prepared) if prepared.installers.len() == 1 => {
+                let installer = prepared.installers[0].clone();
+                self.start_installer(prepared, installer, sender);
+            }
+            Ok(prepared) => {
+                set_path_choices(&self.wizard_installer_dropdown, &prepared.installers);
+                if let Some(wizard) = &mut self.wizard {
+                    wizard.phase = WizardPhase::ChooseInstaller;
+                    wizard.prepared = Some(prepared);
+                    wizard.error = None;
+                }
+            }
+            Err(error) => {
+                let can_choose_another_disc = original.source.disc_images.len() > 1;
+                if let Some(wizard) = &mut self.wizard {
+                    wizard.phase = if can_choose_another_disc {
+                        WizardPhase::ChooseDisc
+                    } else {
+                        WizardPhase::Review
+                    };
+                    wizard.prepared_source = Some(original);
+                    wizard.error = Some(error.to_string());
+                }
+            }
+        }
+    }
+
+    fn start_installer(
+        &mut self,
+        prepared: PreparedInstall,
+        installer: PathBuf,
+        sender: ComponentSender<App>,
+    ) {
+        if let Some(wizard) = &mut self.wizard {
+            wizard.phase = WizardPhase::Installing;
+            wizard.prepared = None;
+            wizard.error = None;
+        }
+        thread::spawn(move || {
+            let original = prepared.clone();
+            let result = execute_install(prepared, installer);
+            sender.input(AppMsg::InstallationFinished {
+                prepared: original,
+                result,
+            });
+        });
+    }
+
+    fn installation_finished(
+        &mut self,
+        prepared: PreparedInstall,
+        result: Result<InstallOutcome, InstallError>,
+    ) {
+        match result {
+            Ok(outcome) => {
+                set_path_choices(&self.wizard_executable_dropdown, &outcome.executables);
+                if let Some(wizard) = &mut self.wizard {
+                    wizard.phase = WizardPhase::ChooseExecutable;
+                    wizard.prepared = None;
+                    wizard.selected_executable = None;
+                    wizard.error = if outcome.executables.is_empty() {
+                        Some(
+                            "No new .exe was found outside drive_c/windows. Choose the installed game executable manually."
+                                .to_owned(),
+                        )
+                    } else {
+                        None
+                    };
+                    wizard.outcome = Some(outcome);
+                }
+            }
+            Err(error) => {
+                set_path_choices(&self.wizard_installer_dropdown, &prepared.installers);
+                if let Some(wizard) = &mut self.wizard {
+                    wizard.phase = WizardPhase::ChooseInstaller;
+                    wizard.prepared = Some(prepared);
+                    wizard.error = Some(error.to_string());
+                }
+            }
+        }
+    }
+
+    fn start_saving_profile(&mut self, sender: ComponentSender<App>) {
+        let Some(wizard) = &mut self.wizard else {
+            return;
+        };
+        let Some(outcome) = wizard.outcome.take() else {
+            return;
+        };
+        let executable = wizard
+            .selected_executable
+            .clone()
+            .or_else(|| selected_path(&outcome.executables, &self.wizard_executable_dropdown));
+        let Some(executable) = executable else {
+            wizard.outcome = Some(outcome);
+            wizard.error = Some("Choose the installed game executable.".to_owned());
+            return;
+        };
+        let profile = match outcome.launch_profile(executable) {
+            Ok(profile) => profile,
+            Err(error) => {
+                wizard.outcome = Some(outcome);
+                wizard.error = Some(error.to_string());
+                return;
+            }
+        };
+        let Some(store) = self.profile_store.clone() else {
+            wizard.outcome = Some(outcome);
+            wizard.error = Some("The profile database is unavailable.".to_owned());
+            return;
+        };
+        let title = outcome.title.clone();
+        wizard.phase = WizardPhase::Saving;
+        wizard.error = None;
+
+        thread::spawn(move || {
+            let result = store.save(&title, &profile);
+            sender.input(AppMsg::ProfileSaved { outcome, result });
+        });
+    }
+
+    fn profile_saved(
+        &mut self,
+        outcome: InstallOutcome,
+        result: Result<StoredProfile, ProfileError>,
+    ) {
+        match result {
+            Ok(stored) => {
+                outcome.cleanup_after_save();
+                self.games.push(LibraryGame {
+                    title: stored.title,
+                    origin: GameOrigin::Installed(stored.profile),
+                    thumbnail: None,
+                });
+                self.wizard = None;
+                self.library_error = None;
+                self.refresh_games_list();
+                self.page = Page::Library;
+            }
+            Err(error) => {
+                if let Some(wizard) = &mut self.wizard {
+                    wizard.phase = WizardPhase::ChooseExecutable;
+                    wizard.outcome = Some(outcome);
+                    wizard.error = Some(error.to_string());
+                }
+            }
+        }
+    }
+
+    fn show_executable_chooser(&self, root: &adw::ApplicationWindow, sender: ComponentSender<App>) {
+        let Some(outcome) = self
+            .wizard
+            .as_ref()
+            .filter(|wizard| wizard.phase == WizardPhase::ChooseExecutable)
+            .and_then(|wizard| wizard.outcome.as_ref())
+        else {
+            return;
+        };
+        show_executable_chooser(root, sender, &outcome.prefix.join("drive_c"));
     }
 
     fn add_vndb_title(&mut self, entry: SearchResultWithThumbnail) {
@@ -482,6 +1249,12 @@ impl App {
     }
 
     fn show_library(&mut self) {
+        if self.wizard_is_busy() {
+            return;
+        }
+        if let Some(wizard) = self.wizard.take() {
+            wizard.discard();
+        }
         self.page = Page::Library;
         self.query.clear();
         self.query_entry.set_text("");
@@ -515,11 +1288,73 @@ impl App {
     }
 }
 
+impl InstallWizard {
+    fn discard(self) {
+        if let Some(outcome) = self.outcome {
+            outcome.discard();
+        } else if let Some(prepared) = self.prepared {
+            prepared.discard();
+        } else if let Some(prepared) = self.prepared_source {
+            prepared.discard();
+        }
+    }
+}
+
+fn set_path_choices(dropdown: &gtk::DropDown, paths: &[PathBuf]) {
+    let labels: Vec<String> = paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect();
+    let references: Vec<&str> = labels.iter().map(String::as_str).collect();
+    let model = gtk::StringList::new(&references);
+    dropdown.set_model(Some(&model));
+    dropdown.set_selected(if paths.is_empty() {
+        gtk::INVALID_LIST_POSITION
+    } else {
+        0
+    });
+    dropdown.set_sensitive(!paths.is_empty());
+}
+
+fn selected_path(paths: &[PathBuf], dropdown: &gtk::DropDown) -> Option<PathBuf> {
+    paths.get(dropdown.selected() as usize).cloned()
+}
+
+fn show_executable_chooser(
+    root: &adw::ApplicationWindow,
+    sender: ComponentSender<App>,
+    drive_c: &Path,
+) {
+    let chooser = gtk::FileChooserNative::new(
+        Some("Choose installed game executable"),
+        Some(root),
+        gtk::FileChooserAction::Open,
+        Some("Choose"),
+        Some("Cancel"),
+    );
+    let executables = gtk::FileFilter::new();
+    executables.set_name(Some("Windows executables"));
+    executables.add_pattern("*.exe");
+    executables.add_pattern("*.EXE");
+    chooser.add_filter(&executables);
+    let folder = gtk::gio::File::for_path(drive_c);
+    let _ = chooser.set_current_folder(Some(&folder));
+    chooser.connect_response(move |chooser, response| {
+        if response == gtk::ResponseType::Accept
+            && let Some(path) = chooser.file().and_then(|file| file.path())
+        {
+            sender.input(AppMsg::WizardExecutableSelected(path));
+        }
+        chooser.destroy();
+    });
+    chooser.show();
+}
+
 fn show_local_source_prompt(root: &adw::ApplicationWindow, sender: ComponentSender<App>) {
     let window = gtk::Window::builder()
         .transient_for(root)
         .modal(true)
-        .title("Add archive or folder")
+        .title("Install from local files")
         .resizable(false)
         .build();
 
@@ -527,7 +1362,7 @@ fn show_local_source_prompt(root: &adw::ApplicationWindow, sender: ComponentSend
     content.set_margin_all(18);
 
     let description = gtk::Label::new(Some(
-        "The path is classified and added. Archives are not extracted here.",
+        "Choose an archive, disc image, installer, or folder. The wizard will prepare a separate Wine prefix and run the installer.",
     ));
     description.set_wrap(true);
     description.set_xalign(0.0);
@@ -538,7 +1373,7 @@ fn show_local_source_prompt(root: &adw::ApplicationWindow, sender: ComponentSend
     buttons.set_halign(gtk::Align::End);
 
     let cancel = gtk::Button::with_label("Cancel");
-    let archive = gtk::Button::with_label("Archive");
+    let archive = gtk::Button::with_label("File");
     archive.add_css_class("suggested-action");
     let folder = gtk::Button::with_label("Folder");
 
@@ -573,7 +1408,7 @@ fn show_source_chooser(
 ) {
     let title = match action {
         gtk::FileChooserAction::SelectFolder => "Choose a folder",
-        _ => "Choose an archive or folder",
+        _ => "Choose install files",
     };
     let chooser = gtk::FileChooserNative::new(
         Some(title),
@@ -585,8 +1420,11 @@ fn show_source_chooser(
 
     if action == gtk::FileChooserAction::Open {
         let supported = gtk::FileFilter::new();
-        supported.set_name(Some("Archives"));
-        for pattern in ["*.7z", "*.rar", "*.zip"] {
+        supported.set_name(Some("Install sources"));
+        for pattern in [
+            "*.7z", "*.rar", "*.zip", "*.iso", "*.mds", "*.exe", "*.7Z", "*.RAR", "*.ZIP", "*.ISO",
+            "*.MDS", "*.EXE",
+        ] {
             supported.add_pattern(pattern);
         }
         chooser.add_filter(&supported);
@@ -672,7 +1510,12 @@ fn build_game_card(game: &LibraryGame) -> gtk::Box {
 
 fn game_subtitle(game: &LibraryGame) -> String {
     match &game.origin {
-        GameOrigin::Local(source) => format!("{}\n{}", source.kind, source.path.display()),
+        GameOrigin::Installed(profile) => format!(
+            "{} {}\n{}",
+            profile.runner.as_str(),
+            profile.arch.as_str(),
+            profile.exe.display()
+        ),
         GameOrigin::Vndb(summary) => {
             let mut subtitle = summary.id.clone();
             if let Some(released) = &summary.released {
@@ -740,7 +1583,12 @@ fn thumbnail_texture(thumbnail: Vec<u8>, width: i32, height: i32) -> Option<gtk:
     Some(gtk::gdk::Texture::for_pixbuf(&scaled))
 }
 
-fn apply_cover_slot(widget: &impl gtk::prelude::WidgetExt, width: i32, height: i32, css_class: &str) {
+fn apply_cover_slot(
+    widget: &impl gtk::prelude::WidgetExt,
+    width: i32,
+    height: i32,
+    css_class: &str,
+) {
     widget.set_size_request(width, height);
     widget.set_hexpand(false);
     widget.set_vexpand(false);
@@ -861,6 +1709,7 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::{
+        profile::{LaunchProfile, PrefixArch, Runner},
         stages::identify::{IdentifiedSource, SourceKind},
         vndb::VnSummary,
     };
@@ -893,19 +1742,19 @@ mod tests {
     fn thumbnail_texture_normalizes_to_cover_slot() {
         gtk::init().expect("gtk init");
         let image = gtk::Image::from_icon_name("image-missing-symbolic");
-        super::apply_cover_slot(&image, super::COVER_WIDTH, super::COVER_HEIGHT, "vndb-cover");
+        super::apply_cover_slot(
+            &image,
+            super::COVER_WIDTH,
+            super::COVER_HEIGHT,
+            "vndb-cover",
+        );
         assert_eq!(image.width_request(), super::COVER_WIDTH);
         assert_eq!(image.height_request(), super::COVER_HEIGHT);
         assert!(image.has_css_class("vndb-cover"));
 
-        let pixbuf = gtk::gdk_pixbuf::Pixbuf::new(
-            gtk::gdk_pixbuf::Colorspace::Rgb,
-            false,
-            8,
-            400,
-            200,
-        )
-        .expect("pixbuf");
+        let pixbuf =
+            gtk::gdk_pixbuf::Pixbuf::new(gtk::gdk_pixbuf::Colorspace::Rgb, false, 8, 400, 200)
+                .expect("pixbuf");
         pixbuf.fill(0x3366_99ff);
         let png = pixbuf.save_to_bufferv("png", &[]).expect("encode png");
         let texture = super::thumbnail_texture(png, super::COVER_WIDTH, super::COVER_HEIGHT)
@@ -929,19 +1778,36 @@ mod tests {
     }
 
     #[test]
-    fn local_add_uses_cleaned_file_name_without_vndb() {
+    fn install_source_uses_cleaned_file_name_without_vndb() {
         let source = IdentifiedSource {
             path: PathBuf::from("[Group] Subarashiki_Hibi [ENG].7z"),
             kind: SourceKind::Archive(crate::stages::identify::ArchiveFormat::SevenZip),
         };
+
         assert_eq!(super::fallback_title(&source), "Subarashiki Hibi");
-        assert_eq!(
-            super::game_subtitle(&LibraryGame {
-                title: "Subarashiki Hibi".to_owned(),
-                origin: GameOrigin::Local(source),
-                thumbnail: None,
+    }
+
+    #[test]
+    fn installed_game_card_uses_the_saved_launch_profile() {
+        let game = LibraryGame {
+            title: "Subarashiki Hibi".to_owned(),
+            origin: GameOrigin::Installed(LaunchProfile {
+                exe: PathBuf::from("/games/prefix/drive_c/Game/game.exe"),
+                prefix: PathBuf::from("/games/prefix"),
+                arch: PrefixArch::Win32,
+                runner: Runner::Wine,
+                locale: "ja_JP.UTF-8".to_owned(),
+                disc: None,
+                winetricks: Vec::new(),
+                vndb_id: None,
+                notes: String::new(),
             }),
-            "7-Zip archive\n[Group] Subarashiki_Hibi [ENG].7z"
+            thumbnail: None,
+        };
+
+        assert_eq!(
+            super::game_subtitle(&game),
+            "wine win32\n/games/prefix/drive_c/Game/game.exe"
         );
     }
 
@@ -959,7 +1825,10 @@ mod tests {
             thumbnail: None,
         };
 
-        assert_eq!(super::game_subtitle(&game), "v1 · 2010-03-26\nNo local files");
+        assert_eq!(
+            super::game_subtitle(&game),
+            "v1 · 2010-03-26\nNo local files"
+        );
     }
 
     #[test]

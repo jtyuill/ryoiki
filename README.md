@@ -2,10 +2,10 @@
 
 Native Linux visual novel setup manager. The current source build provides:
 
-- A GTK 4/libadwaita library home. + adds an archive/folder or a VNDB title.
-- Local add classifies the path and stores it. VNDB add stores metadata only. No extract or ISO handling on add.
-
-The setup pipeline is still in progress. It does not yet extract media, create Wine prefixes, run installers, or save launch profiles.
+- A GTK 4/libadwaita library home. + starts a local install or adds a VNDB title.
+- The install wizard accepts archives, disc images, folders, and Windows installers. It extracts with `7z`, creates an isolated per-game Wine prefix, keeps Windows user folders inside that prefix, maps extracted disc files as `d:`, and runs the installer interactively.
+- After setup, the wizard discovers new executables, asks which one to launch, and saves the launch profile in SQLite. Saved profiles load back into the library.
+- Multiple discs and setup programs require an explicit choice. Physical-disc checks, copy protection workarounds, and library launching are not implemented.
 
 ## Build from source
 
@@ -15,6 +15,9 @@ Requirements:
 - GTK 4 and libadwaita development files
 - `pkg-config`
 - A C compiler and linker
+- `7z`
+- `wine` and `wineboot`
+- `locale` and `localedef` (used to generate a private `ja_JP.UTF-8` locale when needed)
 
 Build and run:
 

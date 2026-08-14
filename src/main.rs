@@ -1,4 +1,5 @@
 mod app;
+mod profile;
 mod stages;
 mod vndb;
 
