@@ -11,17 +11,18 @@ use crate::{
 
 const COVER_WIDTH: i32 = 72;
 const COVER_HEIGHT: i32 = 108;
+const CARD_COVER_WIDTH: i32 = 144;
+const CARD_COVER_HEIGHT: i32 = 216;
 
 pub struct App {
     page: Page,
     games: Vec<LibraryGame>,
-    source: Option<IdentifiedSource>,
-    source_error: Option<String>,
+    library_error: Option<String>,
     query: String,
     search: SearchState,
     vndb: VndbClient,
     sender: ComponentSender<App>,
-    games_list: gtk::ListBox,
+    games_grid: gtk::FlowBox,
     query_entry: gtk::Entry,
     results_list: gtk::ListBox,
 }
@@ -29,21 +30,21 @@ pub struct App {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Page {
     Library,
-    Identify,
+    Search,
 }
 
 impl Page {
     fn name(self) -> &'static str {
         match self {
             Self::Library => "library",
-            Self::Identify => "identify",
+            Self::Search => "search",
         }
     }
 
     fn title(self) -> &'static str {
         match self {
             Self::Library => "Library",
-            Self::Identify => "Add game",
+            Self::Search => "Search VNDB",
         }
     }
 }
@@ -51,19 +52,26 @@ impl Page {
 #[derive(Clone, Debug)]
 struct LibraryGame {
     title: String,
-    source: IdentifiedSource,
+    origin: GameOrigin,
     thumbnail: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug)]
+enum GameOrigin {
+    Local(IdentifiedSource),
+    Vndb(VnSummary),
 }
 
 #[derive(Debug)]
 pub enum AppMsg {
+    AddLocal,
     ChooseSourceFile,
     ChooseSourceFolder,
     SourceSelected(PathBuf),
+    ShowSearch,
     QueryChanged(String),
     SearchVndb,
     SelectMatch(SearchResultWithThumbnail),
-    AddWithoutMetadata,
     ShowLibrary,
 }
 
@@ -71,7 +79,6 @@ pub enum AppMsg {
 pub enum CommandOutput {
     SearchFinished {
         query: String,
-        auto: bool,
         result: Result<SearchDisplayResults, VndbError>,
     },
 }
@@ -125,7 +132,7 @@ impl Component for App {
                         set_icon_name: "go-previous-symbolic",
                         set_tooltip_text: Some("Back to library"),
                         #[watch]
-                        set_visible: model.page == Page::Identify,
+                        set_visible: model.page == Page::Search,
                         connect_clicked => AppMsg::ShowLibrary,
                     },
 
@@ -137,9 +144,8 @@ impl Component for App {
                     },
 
                     pack_end = &gtk::MenuButton {
-                        set_label: "Add game",
                         set_icon_name: "list-add-symbolic",
-                        set_always_show_arrow: true,
+                        set_tooltip_text: Some("Add game"),
                         #[watch]
                         set_visible: model.page == Page::Library,
 
@@ -151,15 +157,17 @@ impl Component for App {
                                 set_margin_all: 6,
 
                                 gtk::Button {
-                                    set_label: "Add archive",
+                                    set_label: "Archive or folder",
                                     add_css_class: "flat",
-                                    connect_clicked => AppMsg::ChooseSourceFile,
+                                    connect_clicked => AppMsg::AddLocal,
                                 },
 
+                                gtk::Separator {},
+
                                 gtk::Button {
-                                    set_label: "Add folder",
+                                    set_label: "Search VNDB",
                                     add_css_class: "flat",
-                                    connect_clicked => AppMsg::ChooseSourceFolder,
+                                    connect_clicked => AppMsg::ShowSearch,
                                 },
                             },
                         },
@@ -175,7 +183,7 @@ impl Component for App {
             set_transition_type: gtk::StackTransitionType::Crossfade,
             set_transition_duration: 150,
             add_named: (&library_page, Some("library")),
-            add_named: (&identify_page, Some("identify")),
+            add_named: (&search_page, Some("search")),
             #[watch]
             set_visible_child_name: model.page.name(),
         },
@@ -184,31 +192,34 @@ impl Component for App {
             set_hscrollbar_policy: gtk::PolicyType::Never,
 
             #[wrap(Some)]
-            set_child = &adw::Clamp {
-                set_hexpand: true,
-                set_maximum_size: 720,
-                set_tightening_threshold: 520,
+            set_child = &gtk::Box {
+                set_orientation: gtk::Orientation::Vertical,
+                set_spacing: 18,
+                set_margin_all: 24,
 
-                #[wrap(Some)]
-                set_child = &gtk::Box {
-                    set_orientation: gtk::Orientation::Vertical,
-                    set_spacing: 24,
-                    set_margin_all: 32,
-
-                    adw::StatusPage {
-                        set_icon_name: Some("folder-documents-symbolic"),
-                        set_title: "No games yet",
-                        set_description: Some("Add an archive. ryoiki will try the file name, then VNDB."),
-                        #[watch]
-                        set_visible: model.games.is_empty(),
-                    },
-
-                    append: &model.games_list,
+                adw::StatusPage {
+                    set_icon_name: Some("folder-documents-symbolic"),
+                    set_title: "No games yet",
+                    set_description: Some("Press + to add an archive, a folder, or a VNDB title."),
+                    #[watch]
+                    set_visible: model.games.is_empty(),
                 },
+
+                gtk::Label {
+                    #[watch]
+                    set_label: model.library_error.as_deref().unwrap_or(""),
+                    #[watch]
+                    set_visible: model.library_error.is_some(),
+                    set_xalign: 0.0,
+                    set_wrap: true,
+                    set_selectable: true,
+                },
+
+                append: &model.games_grid,
             },
         },
 
-        identify_page = &gtk::ScrolledWindow {
+        search_page = &gtk::ScrolledWindow {
             set_hscrollbar_policy: gtk::PolicyType::Never,
 
             #[wrap(Some)]
@@ -224,37 +235,16 @@ impl Component for App {
                     set_margin_all: 32,
 
                     gtk::Label {
-                        set_label: "Identify this source",
+                        set_label: "Add from VNDB",
                         set_xalign: 0.0,
                         add_css_class: "title-1",
                     },
 
                     gtk::Label {
-                        set_label: "The file name is searched first. If that is not enough, pick a VNDB title.",
+                        set_label: "Search and add a title. No local files will be installed.",
                         set_xalign: 0.0,
                         set_wrap: true,
                         add_css_class: "dim-label",
-                    },
-
-                    adw::PreferencesGroup {
-                        set_title: "Source",
-                        set_description: Some("User-owned files only"),
-
-                        adw::ActionRow {
-                            set_title: "Selected source",
-                            #[watch]
-                            set_subtitle: &model.source_description(),
-                        },
-                    },
-
-                    gtk::Label {
-                        #[watch]
-                        set_label: &model.source_status(),
-                        #[watch]
-                        set_visible: model.has_source_status(),
-                        set_xalign: 0.0,
-                        set_wrap: true,
-                        set_selectable: true,
                     },
 
                     gtk::Box {
@@ -289,13 +279,6 @@ impl Component for App {
                     },
 
                     append: &model.results_list,
-
-                    gtk::Button {
-                        set_label: "Add without metadata",
-                        #[watch]
-                        set_sensitive: model.source.is_some(),
-                        connect_clicked => AppMsg::AddWithoutMetadata,
-                    },
                 },
             },
         },
@@ -306,10 +289,16 @@ impl Component for App {
         root: Self::Root,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
-        let games_list = gtk::ListBox::new();
-        games_list.set_selection_mode(gtk::SelectionMode::None);
-        games_list.add_css_class("boxed-list");
-        games_list.set_visible(false);
+        let games_grid = gtk::FlowBox::new();
+        games_grid.set_selection_mode(gtk::SelectionMode::None);
+        games_grid.set_homogeneous(true);
+        games_grid.set_min_children_per_line(1);
+        games_grid.set_max_children_per_line(8);
+        games_grid.set_column_spacing(12);
+        games_grid.set_row_spacing(12);
+        games_grid.set_valign(gtk::Align::Start);
+        games_grid.set_hexpand(true);
+        games_grid.set_visible(false);
 
         let query_entry = gtk::Entry::new();
         query_entry.set_hexpand(true);
@@ -331,13 +320,12 @@ impl Component for App {
         let model = Self {
             page: Page::Library,
             games: Vec::new(),
-            source: None,
-            source_error: None,
+            library_error: None,
             query: String::new(),
             search: SearchState::Idle,
             vndb: VndbClient::new(),
             sender: sender.clone(),
-            games_list,
+            games_grid,
             query_entry,
             results_list,
         };
@@ -351,23 +339,26 @@ impl Component for App {
             AppMsg::ChooseSourceFile => {
                 show_source_chooser(root, sender, gtk::FileChooserAction::Open);
             }
+            AppMsg::AddLocal => {
+                show_local_source_prompt(root, sender);
+            }
             AppMsg::ChooseSourceFolder => {
                 show_source_chooser(root, sender, gtk::FileChooserAction::SelectFolder);
             }
             AppMsg::SourceSelected(path) => {
-                self.open_source(path, sender);
+                self.add_local_source(path);
+            }
+            AppMsg::ShowSearch => {
+                self.show_search();
             }
             AppMsg::QueryChanged(query) => {
                 self.query = query;
             }
             AppMsg::SearchVndb => {
-                self.start_search(sender, false);
+                self.start_search(sender);
             }
             AppMsg::SelectMatch(entry) => {
-                self.add_game(Some(entry));
-            }
-            AppMsg::AddWithoutMetadata => {
-                self.add_game(None);
+                self.add_vndb_title(entry);
             }
             AppMsg::ShowLibrary => {
                 self.show_library();
@@ -382,19 +373,7 @@ impl Component for App {
         _root: &Self::Root,
     ) {
         match message {
-            CommandOutput::SearchFinished {
-                query,
-                auto,
-                result,
-            } => match result {
-                Ok(results) if auto && should_accept_auto_match(&results) => {
-                    let entry = results
-                        .entries
-                        .into_iter()
-                        .next()
-                        .expect("auto-match requires one result");
-                    self.add_game(Some(entry));
-                }
+            CommandOutput::SearchFinished { query, result } => match result {
                 Ok(results) => {
                     let count = results.entries.len();
                     self.replace_search_results(results.entries);
@@ -417,28 +396,6 @@ impl Component for App {
 }
 
 impl App {
-    fn source_description(&self) -> String {
-        self.source
-            .as_ref()
-            .map(|source| source.path.display().to_string())
-            .unwrap_or_else(|| "Nothing selected".to_owned())
-    }
-
-    fn source_status(&self) -> String {
-        if let Some(error) = &self.source_error {
-            return error.clone();
-        }
-
-        self.source
-            .as_ref()
-            .map(|source| format!("Detected: {}", source.kind))
-            .unwrap_or_default()
-    }
-
-    fn has_source_status(&self) -> bool {
-        self.source.is_some() || self.source_error.is_some()
-    }
-
     fn can_search(&self) -> bool {
         !self.query.trim().is_empty() && !self.is_searching()
     }
@@ -449,15 +406,12 @@ impl App {
 
     fn search_text(&self) -> String {
         match &self.search {
-            SearchState::Idle => {
-                "A unique file-name match is added automatically. Otherwise search VNDB."
-                    .to_owned()
-            }
+            SearchState::Idle => "Enter a title. Choosing a result adds it without installing files.".to_owned(),
             SearchState::Loading { query } => format!("Searching for “{query}”…"),
             SearchState::Loaded {
                 query, count: 0, ..
             } => {
-                format!("No VNDB results for “{query}”. Search again or add without metadata.")
+                format!("No VNDB results for “{query}”.")
             }
             SearchState::Loaded { query, count, more } => {
                 let noun = if *count == 1 { "result" } else { "results" };
@@ -466,7 +420,7 @@ impl App {
                 } else {
                     ""
                 };
-                format!("{count} {noun} for “{query}”. Pick one.{suffix}")
+                format!("{count} {noun} for “{query}”. Pick one to add.{suffix}")
             }
             SearchState::Failed { query, message } => {
                 format!("Search for “{query}” failed.\n\n{message}")
@@ -474,33 +428,43 @@ impl App {
         }
     }
 
-    fn open_source(&mut self, path: PathBuf, sender: ComponentSender<App>) {
-        self.page = Page::Identify;
-        self.replace_search_results(Vec::new());
+    fn add_local_source(&mut self, path: PathBuf) {
         match identify_source(path) {
             Ok(source) => {
-                let query = guess_search_query(&source.path);
-                self.source = Some(source);
-                self.source_error = None;
-                self.query = query.clone();
-                self.query_entry.set_text(&query);
-                if query.is_empty() {
-                    self.search = SearchState::Idle;
-                } else {
-                    self.start_search(sender, true);
-                }
+                let title = fallback_title(&source);
+                self.games.push(LibraryGame {
+                    title,
+                    origin: GameOrigin::Local(source),
+                    thumbnail: None,
+                });
+                self.library_error = None;
+                self.refresh_games_list();
+                self.show_library();
             }
             Err(error) => {
-                self.source = None;
-                self.source_error = Some(error.to_string());
-                self.query.clear();
-                self.query_entry.set_text("");
-                self.search = SearchState::Idle;
+                self.library_error = Some(error.to_string());
+                self.show_library();
             }
         }
     }
 
-    fn start_search(&mut self, sender: ComponentSender<App>, auto: bool) {
+    fn add_vndb_title(&mut self, entry: SearchResultWithThumbnail) {
+        self.games.push(LibraryGame {
+            title: entry.summary.title.clone(),
+            origin: GameOrigin::Vndb(entry.summary),
+            thumbnail: entry.thumbnail,
+        });
+        self.library_error = None;
+        self.refresh_games_list();
+        self.show_library();
+    }
+
+    fn show_search(&mut self) {
+        self.page = Page::Search;
+        self.library_error = None;
+    }
+
+    fn start_search(&mut self, sender: ComponentSender<App>) {
         if !self.can_search() {
             return;
         }
@@ -513,35 +477,12 @@ impl App {
         };
         sender.oneshot_command(async move {
             let result = search_with_thumbnails(client, &query).await;
-            CommandOutput::SearchFinished {
-                query,
-                auto,
-                result,
-            }
+            CommandOutput::SearchFinished { query, result }
         });
-    }
-
-    fn add_game(&mut self, matched: Option<SearchResultWithThumbnail>) {
-        let Some(source) = self.source.clone() else {
-            return;
-        };
-        let (title, thumbnail) = match matched {
-            Some(entry) => (entry.summary.title, entry.thumbnail),
-            None => (fallback_title(&source), None),
-        };
-        self.games.push(LibraryGame {
-            title,
-            source,
-            thumbnail,
-        });
-        self.refresh_games_list();
-        self.show_library();
     }
 
     fn show_library(&mut self) {
         self.page = Page::Library;
-        self.source = None;
-        self.source_error = None;
         self.query.clear();
         self.query_entry.set_text("");
         self.search = SearchState::Idle;
@@ -549,15 +490,15 @@ impl App {
     }
 
     fn refresh_games_list(&self) {
-        while let Some(child) = self.games_list.first_child() {
-            self.games_list.remove(&child);
+        while let Some(child) = self.games_grid.first_child() {
+            self.games_grid.remove(&child);
         }
 
         for game in &self.games {
-            self.games_list.append(&build_game_row(game));
+            self.games_grid.append(&build_game_card(game));
         }
-        self.games_list
-            .set_visible(self.games_list.first_child().is_some());
+        self.games_grid
+            .set_visible(self.games_grid.first_child().is_some());
     }
 
     fn replace_search_results(&self, entries: Vec<SearchResultWithThumbnail>) {
@@ -574,14 +515,65 @@ impl App {
     }
 }
 
+fn show_local_source_prompt(root: &adw::ApplicationWindow, sender: ComponentSender<App>) {
+    let window = gtk::Window::builder()
+        .transient_for(root)
+        .modal(true)
+        .title("Add archive or folder")
+        .resizable(false)
+        .build();
+
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    content.set_margin_all(18);
+
+    let description = gtk::Label::new(Some(
+        "The path is classified and added. Archives are not extracted here.",
+    ));
+    description.set_wrap(true);
+    description.set_xalign(0.0);
+    description.add_css_class("dim-label");
+    content.append(&description);
+
+    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    buttons.set_halign(gtk::Align::End);
+
+    let cancel = gtk::Button::with_label("Cancel");
+    let archive = gtk::Button::with_label("Archive");
+    archive.add_css_class("suggested-action");
+    let folder = gtk::Button::with_label("Folder");
+
+    let cancel_window = window.clone();
+    cancel.connect_clicked(move |_| cancel_window.close());
+
+    let archive_window = window.clone();
+    let archive_sender = sender.clone();
+    archive.connect_clicked(move |_| {
+        archive_window.close();
+        archive_sender.input(AppMsg::ChooseSourceFile);
+    });
+
+    let folder_window = window.clone();
+    folder.connect_clicked(move |_| {
+        folder_window.close();
+        sender.input(AppMsg::ChooseSourceFolder);
+    });
+
+    buttons.append(&cancel);
+    buttons.append(&folder);
+    buttons.append(&archive);
+    content.append(&buttons);
+    window.set_child(Some(&content));
+    window.present();
+}
+
 fn show_source_chooser(
     root: &adw::ApplicationWindow,
     sender: ComponentSender<App>,
     action: gtk::FileChooserAction,
 ) {
     let title = match action {
-        gtk::FileChooserAction::SelectFolder => "Choose a source folder",
-        _ => "Choose an archive, disc image, or installer",
+        gtk::FileChooserAction::SelectFolder => "Choose a folder",
+        _ => "Choose an archive or folder",
     };
     let chooser = gtk::FileChooserNative::new(
         Some(title),
@@ -593,8 +585,8 @@ fn show_source_chooser(
 
     if action == gtk::FileChooserAction::Open {
         let supported = gtk::FileFilter::new();
-        supported.set_name(Some("Supported sources"));
-        for pattern in ["*.7z", "*.rar", "*.zip", "*.iso", "*.mds", "*.exe"] {
+        supported.set_name(Some("Archives"));
+        for pattern in ["*.7z", "*.rar", "*.zip"] {
             supported.add_pattern(pattern);
         }
         chooser.add_filter(&supported);
@@ -638,19 +630,59 @@ async fn search_with_thumbnails(
     })
 }
 
-fn build_game_row(game: &LibraryGame) -> adw::ActionRow {
-    let row = adw::ActionRow::new();
-    row.set_title(&game.title);
-    row.set_subtitle(&format!(
-        "{}\n{}",
-        game.source.kind,
-        game.source.path.display()
-    ));
-    row.add_prefix(&cover_widget(
+fn build_game_card(game: &LibraryGame) -> gtk::Box {
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    card.add_css_class("card");
+    card.add_css_class("library-card");
+    card.set_hexpand(false);
+    card.set_halign(gtk::Align::Center);
+
+    card.append(&cover_widget(
         game.thumbnail.clone(),
         &format!("Cover for {}", game.title),
+        CARD_COVER_WIDTH,
+        CARD_COVER_HEIGHT,
+        "library-cover",
     ));
-    row
+
+    let title = gtk::Label::new(Some(&game.title));
+    title.set_wrap(true);
+    title.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    title.set_justify(gtk::Justification::Center);
+    title.set_xalign(0.5);
+    title.set_max_width_chars(18);
+    title.set_lines(2);
+    title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    title.add_css_class("heading");
+    card.append(&title);
+
+    let subtitle = gtk::Label::new(Some(&game_subtitle(game)));
+    subtitle.set_wrap(true);
+    subtitle.set_justify(gtk::Justification::Center);
+    subtitle.set_xalign(0.5);
+    subtitle.set_max_width_chars(18);
+    subtitle.set_lines(2);
+    subtitle.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    subtitle.add_css_class("dim-label");
+    subtitle.add_css_class("caption");
+    card.append(&subtitle);
+
+    card
+}
+
+fn game_subtitle(game: &LibraryGame) -> String {
+    match &game.origin {
+        GameOrigin::Local(source) => format!("{}\n{}", source.kind, source.path.display()),
+        GameOrigin::Vndb(summary) => {
+            let mut subtitle = summary.id.clone();
+            if let Some(released) = &summary.released {
+                subtitle.push_str(" · ");
+                subtitle.push_str(released);
+            }
+            subtitle.push_str("\nNo local files");
+            subtitle
+        }
+    }
 }
 
 fn build_result_row(
@@ -664,6 +696,9 @@ fn build_result_row(
     row.add_prefix(&cover_widget(
         entry.thumbnail.clone(),
         &format!("Cover for {}", entry.summary.title),
+        COVER_WIDTH,
+        COVER_HEIGHT,
+        "vndb-cover",
     ));
     row.connect_activated(move |_| {
         sender.input(AppMsg::SelectMatch(entry.clone()));
@@ -671,45 +706,47 @@ fn build_result_row(
     row
 }
 
-fn cover_widget(thumbnail: Option<Vec<u8>>, alternative_text: &str) -> gtk::Widget {
+fn cover_widget(
+    thumbnail: Option<Vec<u8>>,
+    alternative_text: &str,
+    width: i32,
+    height: i32,
+    css_class: &str,
+) -> gtk::Widget {
     thumbnail
-        .and_then(thumbnail_texture)
+        .and_then(|bytes| thumbnail_texture(bytes, width, height))
         .map(|texture| {
             let picture = gtk::Picture::for_paintable(&texture);
             picture.set_alternative_text(Some(alternative_text));
             picture.set_can_shrink(true);
-            apply_cover_slot(&picture);
+            apply_cover_slot(&picture, width, height, css_class);
             picture.upcast()
         })
         .unwrap_or_else(|| {
             let image = gtk::Image::from_icon_name("image-missing-symbolic");
             image.set_pixel_size(32);
             image.add_css_class("dim-label");
-            apply_cover_slot(&image);
+            apply_cover_slot(&image, width, height, css_class);
             image.upcast()
         })
 }
 
-fn thumbnail_texture(thumbnail: Vec<u8>) -> Option<gtk::gdk::Texture> {
+fn thumbnail_texture(thumbnail: Vec<u8>, width: i32, height: i32) -> Option<gtk::gdk::Texture> {
     let stream = gtk::gio::MemoryInputStream::from_bytes(&gtk::glib::Bytes::from_owned(thumbnail));
     let pixbuf = gtk::gdk_pixbuf::Pixbuf::from_stream(&stream, gtk::gio::Cancellable::NONE).ok()?;
-    let (x, y, width, height) = cover_crop_region(pixbuf.width(), pixbuf.height(), 2, 3);
-    let cropped = pixbuf.new_subpixbuf(x, y, width, height);
-    let scaled = cropped.scale_simple(
-        COVER_WIDTH,
-        COVER_HEIGHT,
-        gtk::gdk_pixbuf::InterpType::Bilinear,
-    )?;
+    let (x, y, crop_width, crop_height) = cover_crop_region(pixbuf.width(), pixbuf.height(), 2, 3);
+    let cropped = pixbuf.new_subpixbuf(x, y, crop_width, crop_height);
+    let scaled = cropped.scale_simple(width, height, gtk::gdk_pixbuf::InterpType::Bilinear)?;
     Some(gtk::gdk::Texture::for_pixbuf(&scaled))
 }
 
-fn apply_cover_slot(widget: &impl gtk::prelude::WidgetExt) {
-    widget.set_size_request(COVER_WIDTH, COVER_HEIGHT);
+fn apply_cover_slot(widget: &impl gtk::prelude::WidgetExt, width: i32, height: i32, css_class: &str) {
+    widget.set_size_request(width, height);
     widget.set_hexpand(false);
     widget.set_vexpand(false);
     widget.set_halign(gtk::Align::Center);
     widget.set_valign(gtk::Align::Center);
-    widget.add_css_class("vndb-cover");
+    widget.add_css_class(css_class);
 }
 
 fn cover_crop_region(
@@ -819,18 +856,17 @@ fn collapse_whitespace(raw: &str) -> String {
     out.trim().to_owned()
 }
 
-fn should_accept_auto_match(results: &SearchDisplayResults) -> bool {
-    results.entries.len() == 1 && !results.more
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
-    use crate::vndb::VnSummary;
+    use crate::{
+        stages::identify::{IdentifiedSource, SourceKind},
+        vndb::VnSummary,
+    };
     use relm4::gtk::{self, prelude::*};
 
-    use super::result_subtitle;
+    use super::{GameOrigin, LibraryGame, result_subtitle};
 
     #[test]
     fn formats_original_title_and_release_for_result_rows() {
@@ -857,7 +893,7 @@ mod tests {
     fn thumbnail_texture_normalizes_to_cover_slot() {
         gtk::init().expect("gtk init");
         let image = gtk::Image::from_icon_name("image-missing-symbolic");
-        super::apply_cover_slot(&image);
+        super::apply_cover_slot(&image, super::COVER_WIDTH, super::COVER_HEIGHT, "vndb-cover");
         assert_eq!(image.width_request(), super::COVER_WIDTH);
         assert_eq!(image.height_request(), super::COVER_HEIGHT);
         assert!(image.has_css_class("vndb-cover"));
@@ -872,9 +908,58 @@ mod tests {
         .expect("pixbuf");
         pixbuf.fill(0x3366_99ff);
         let png = pixbuf.save_to_bufferv("png", &[]).expect("encode png");
-        let texture = super::thumbnail_texture(png).expect("decode cover");
+        let texture = super::thumbnail_texture(png, super::COVER_WIDTH, super::COVER_HEIGHT)
+            .expect("decode cover");
         assert_eq!(texture.width(), super::COVER_WIDTH);
         assert_eq!(texture.height(), super::COVER_HEIGHT);
+
+        let card = super::build_game_card(&super::LibraryGame {
+            title: "Primary".to_owned(),
+            origin: super::GameOrigin::Vndb(VnSummary {
+                id: "v1".to_owned(),
+                title: "Primary".to_owned(),
+                alttitle: None,
+                released: None,
+                image: None,
+            }),
+            thumbnail: None,
+        });
+        assert!(card.has_css_class("library-card"));
+        assert!(card.has_css_class("card"));
+    }
+
+    #[test]
+    fn local_add_uses_cleaned_file_name_without_vndb() {
+        let source = IdentifiedSource {
+            path: PathBuf::from("[Group] Subarashiki_Hibi [ENG].7z"),
+            kind: SourceKind::Archive(crate::stages::identify::ArchiveFormat::SevenZip),
+        };
+        assert_eq!(super::fallback_title(&source), "Subarashiki Hibi");
+        assert_eq!(
+            super::game_subtitle(&LibraryGame {
+                title: "Subarashiki Hibi".to_owned(),
+                origin: GameOrigin::Local(source),
+                thumbnail: None,
+            }),
+            "7-Zip archive\n[Group] Subarashiki_Hibi [ENG].7z"
+        );
+    }
+
+    #[test]
+    fn vndb_add_records_metadata_without_local_files() {
+        let game = LibraryGame {
+            title: "Primary".to_owned(),
+            origin: GameOrigin::Vndb(VnSummary {
+                id: "v1".to_owned(),
+                title: "Primary".to_owned(),
+                alttitle: None,
+                released: Some("2010-03-26".to_owned()),
+                image: None,
+            }),
+            thumbnail: None,
+        };
+
+        assert_eq!(super::game_subtitle(&game), "v1 · 2010-03-26\nNo local files");
     }
 
     #[test]
@@ -895,34 +980,5 @@ mod tests {
             super::guess_search_query(PathBuf::from("素晴らしき日々.7z").as_path()),
             "素晴らしき日々"
         );
-    }
-
-    #[test]
-    fn unique_auto_match_is_accepted_only_when_unambiguous() {
-        let unique = super::SearchDisplayResults {
-            entries: vec![super::SearchResultWithThumbnail {
-                summary: VnSummary {
-                    id: "v1".to_owned(),
-                    title: "One".to_owned(),
-                    alttitle: None,
-                    released: None,
-                    image: None,
-                },
-                thumbnail: None,
-            }],
-            more: false,
-        };
-        let ambiguous = super::SearchDisplayResults {
-            entries: unique.entries.clone(),
-            more: true,
-        };
-        let empty = super::SearchDisplayResults {
-            entries: Vec::new(),
-            more: false,
-        };
-
-        assert!(super::should_accept_auto_match(&unique));
-        assert!(!super::should_accept_auto_match(&ambiguous));
-        assert!(!super::should_accept_auto_match(&empty));
     }
 }

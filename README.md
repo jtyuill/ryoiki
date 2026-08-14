@@ -2,8 +2,8 @@
 
 Native Linux visual novel setup manager. The current source build provides:
 
-- A GTK 4/libadwaita library home. Add game → archive or folder.
-- File-name autodetect, then VNDB search with cover thumbnails if the name is ambiguous
+- A GTK 4/libadwaita library home. + adds an archive/folder or a VNDB title.
+- Local add classifies the path and stores it. VNDB add stores metadata only. No extract or ISO handling on add.
 
 The setup pipeline is still in progress. It does not yet extract media, create Wine prefixes, run installers, or save launch profiles.
 
