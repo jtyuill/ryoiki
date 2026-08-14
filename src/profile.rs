@@ -172,6 +172,20 @@ impl ProfileStore {
         runtime.block_on(self.save_async(title, profile))
     }
 
+    pub fn delete(&self, id: i64) -> Result<(), ProfileError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .map_err(ProfileError::Runtime)?;
+        runtime.block_on(self.delete_async(id))
+    }
+
+    pub fn reorder(&self, ids: &[i64]) -> Result<(), ProfileError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .map_err(ProfileError::Runtime)?;
+        runtime.block_on(self.reorder_async(ids))
+    }
+
     async fn connect(&self) -> Result<SqliteConnection, ProfileError> {
         if let Some(parent) = self.database_path.parent() {
             fs::create_dir_all(parent).map_err(|source| ProfileError::CreateDirectory {
@@ -198,11 +212,27 @@ impl ProfileStore {
                 disc_kind TEXT,\
                 winetricks TEXT NOT NULL,\
                 vndb_id TEXT,\
-                notes TEXT NOT NULL\
+                notes TEXT NOT NULL,\
+                position INTEGER\
             )",
         )
         .execute(&mut connection)
         .await?;
+        let columns = sqlx::query("PRAGMA table_info(launch_profiles)")
+            .fetch_all(&mut connection)
+            .await?;
+        let has_position = columns.iter().any(|row| {
+            row.try_get::<String, _>("name")
+                .is_ok_and(|name| name == "position")
+        });
+        if !has_position {
+            sqlx::query("ALTER TABLE launch_profiles ADD COLUMN position INTEGER")
+                .execute(&mut connection)
+                .await?;
+        }
+        sqlx::query("UPDATE launch_profiles SET position = id WHERE position IS NULL")
+            .execute(&mut connection)
+            .await?;
         Ok(connection)
     }
 
@@ -211,12 +241,35 @@ impl ProfileStore {
         let rows = sqlx::query(
             "SELECT id, title, exe, prefix, arch, runner, locale, disc_path, \
                     disc_drive, disc_kind, winetricks, vndb_id, notes \
-             FROM launch_profiles ORDER BY id",
+             FROM launch_profiles ORDER BY COALESCE(position, id), id",
         )
         .fetch_all(&mut connection)
         .await?;
 
         rows.into_iter().map(decode_profile).collect()
+    }
+
+    async fn delete_async(&self, id: i64) -> Result<(), ProfileError> {
+        let mut connection = self.connect().await?;
+        sqlx::query("DELETE FROM launch_profiles WHERE id = ?")
+            .bind(id)
+            .execute(&mut connection)
+            .await?;
+        Ok(())
+    }
+
+    async fn reorder_async(&self, ids: &[i64]) -> Result<(), ProfileError> {
+        let mut connection = self.connect().await?;
+        let mut transaction = connection.begin().await?;
+        for (position, id) in ids.iter().enumerate() {
+            sqlx::query("UPDATE launch_profiles SET position = ? WHERE id = ?")
+                .bind(position as i64)
+                .bind(id)
+                .execute(&mut *transaction)
+                .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
     }
 
     async fn save_async(
@@ -235,12 +288,16 @@ impl ProfileStore {
             ),
             None => (None, None, None),
         };
+        let position: i64 =
+            sqlx::query_scalar("SELECT COALESCE(MAX(position), -1) + 1 FROM launch_profiles")
+                .fetch_one(&mut connection)
+                .await?;
 
         let result = sqlx::query(
             "INSERT INTO launch_profiles (\
                 title, exe, prefix, arch, runner, locale, disc_path, disc_drive, \
-                disc_kind, winetricks, vndb_id, notes\
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                disc_kind, winetricks, vndb_id, notes, position\
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(title)
         .bind(path_bytes(&profile.exe))
@@ -254,6 +311,7 @@ impl ProfileStore {
         .bind(winetricks)
         .bind(&profile.vndb_id)
         .bind(&profile.notes)
+        .bind(position)
         .execute(&mut connection)
         .await?;
 
@@ -342,7 +400,24 @@ mod tests {
         let stored = store.save("Game", &profile).expect("save profile");
         let loaded = store.load().expect("load profiles");
 
-        assert_eq!(loaded, vec![stored]);
+        assert_eq!(loaded, vec![stored.clone()]);
         assert_eq!(loaded[0].profile, profile);
+
+        let second = store.save("Second", &profile).expect("save second profile");
+        store
+            .reorder(&[second.id, stored.id])
+            .expect("reorder profiles");
+        assert_eq!(
+            store
+                .load()
+                .expect("load reordered profiles")
+                .into_iter()
+                .map(|profile| profile.title)
+                .collect::<Vec<_>>(),
+            vec!["Second", "Game"]
+        );
+
+        store.delete(second.id).expect("delete profile");
+        assert_eq!(store.load().expect("load remaining profiles"), vec![stored]);
     }
 }

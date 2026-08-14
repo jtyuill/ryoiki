@@ -8,13 +8,14 @@ use std::{
 use relm4::{Component, ComponentParts, ComponentSender, RelmWidgetExt, adw, adw::prelude::*, gtk};
 
 use crate::{
-    profile::{LaunchProfile, PrefixArch, ProfileError, ProfileStore, StoredProfile, data_root},
+    profile::{PrefixArch, ProfileError, ProfileStore, StoredProfile, data_root},
     stages::{
         identify::{IdentifiedSource, SourceKind, identify_source},
         install::{
             InstallError, InstallOutcome, InstallRequest, PreparedInstall, PreparedInstallSource,
             RuntimeCommands, execute_install, inspect_install_source, prepare_install_source,
         },
+        launch::{LaunchError, run_game},
     },
     vndb::{VnSummary, VndbClient, VndbError},
 };
@@ -43,6 +44,7 @@ pub struct App {
     wizard_disc_dropdown: gtk::DropDown,
     wizard_installer_dropdown: gtk::DropDown,
     wizard_executable_dropdown: gtk::DropDown,
+    next_temporary_game_id: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -70,8 +72,21 @@ impl Page {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LibraryGameId {
+    Profile(i64),
+    Temporary(u64),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MoveDirection {
+    Previous,
+    Next,
+}
+
 #[derive(Clone, Debug)]
 struct LibraryGame {
+    id: LibraryGameId,
     title: String,
     origin: GameOrigin,
     thumbnail: Option<Vec<u8>>,
@@ -79,7 +94,7 @@ struct LibraryGame {
 
 #[derive(Clone, Debug)]
 enum GameOrigin {
-    Installed(LaunchProfile),
+    Installed(StoredProfile),
     Vndb(VnSummary),
 }
 
@@ -129,6 +144,17 @@ pub enum AppMsg {
     ProfileSaved {
         outcome: InstallOutcome,
         result: Result<StoredProfile, ProfileError>,
+    },
+    LaunchGame(LibraryGameId),
+    GameFinished {
+        title: String,
+        result: Result<(), LaunchError>,
+    },
+    RequestRemoveGame(LibraryGameId),
+    ConfirmRemoveGame(LibraryGameId),
+    MoveGame {
+        id: LibraryGameId,
+        direction: MoveDirection,
     },
     ShowSearch,
     QueryChanged(String),
@@ -584,8 +610,9 @@ impl Component for App {
                         profiles
                             .into_iter()
                             .map(|stored| LibraryGame {
-                                title: stored.title,
-                                origin: GameOrigin::Installed(stored.profile),
+                                id: LibraryGameId::Profile(stored.id),
+                                title: stored.title.clone(),
+                                origin: GameOrigin::Installed(stored),
                                 thumbnail: None,
                             })
                             .collect(),
@@ -616,6 +643,7 @@ impl Component for App {
             wizard_disc_dropdown,
             wizard_installer_dropdown,
             wizard_executable_dropdown,
+            next_temporary_game_id: 1,
         };
         model.refresh_games_list();
         let widgets = view_output!();
@@ -666,6 +694,25 @@ impl Component for App {
             }
             AppMsg::ProfileSaved { outcome, result } => {
                 self.profile_saved(outcome, result);
+            }
+            AppMsg::LaunchGame(id) => {
+                self.start_game(id, sender);
+            }
+            AppMsg::GameFinished { title, result } => {
+                if let Err(error) = result {
+                    self.library_error = Some(format!("“{title}” stopped with an error: {error}"));
+                }
+            }
+            AppMsg::RequestRemoveGame(id) => {
+                if let Some(game) = self.games.iter().find(|game| game.id == id) {
+                    show_remove_game_confirmation(root, sender, id, &game.title);
+                }
+            }
+            AppMsg::ConfirmRemoveGame(id) => {
+                self.remove_game(id);
+            }
+            AppMsg::MoveGame { id, direction } => {
+                self.move_game(id, direction);
             }
             AppMsg::ShowSearch => {
                 self.show_search();
@@ -1184,8 +1231,9 @@ impl App {
             Ok(stored) => {
                 outcome.cleanup_after_save();
                 self.games.push(LibraryGame {
-                    title: stored.title,
-                    origin: GameOrigin::Installed(stored.profile),
+                    id: LibraryGameId::Profile(stored.id),
+                    title: stored.title.clone(),
+                    origin: GameOrigin::Installed(stored),
                     thumbnail: None,
                 });
                 self.wizard = None;
@@ -1216,7 +1264,10 @@ impl App {
     }
 
     fn add_vndb_title(&mut self, entry: SearchResultWithThumbnail) {
+        let id = LibraryGameId::Temporary(self.next_temporary_game_id);
+        self.next_temporary_game_id += 1;
         self.games.push(LibraryGame {
+            id,
             title: entry.summary.title.clone(),
             origin: GameOrigin::Vndb(entry.summary),
             thumbnail: entry.thumbnail,
@@ -1224,6 +1275,77 @@ impl App {
         self.library_error = None;
         self.refresh_games_list();
         self.show_library();
+    }
+
+    fn start_game(&mut self, id: LibraryGameId, sender: ComponentSender<App>) {
+        let Some(game) = self.games.iter().find(|game| game.id == id) else {
+            return;
+        };
+        let GameOrigin::Installed(stored) = &game.origin else {
+            self.library_error = Some("This VNDB entry has no installed files to run.".to_owned());
+            return;
+        };
+        let Some(data_root) = self.data_root.clone() else {
+            self.library_error = Some("The application data directory is unavailable.".to_owned());
+            return;
+        };
+        let profile = stored.profile.clone();
+        let title = game.title.clone();
+        self.library_error = None;
+        thread::spawn(move || {
+            let result = run_game(&profile, &data_root, &RuntimeCommands::default());
+            sender.input(AppMsg::GameFinished { title, result });
+        });
+    }
+
+    fn remove_game(&mut self, id: LibraryGameId) {
+        let Some(index) = self.games.iter().position(|game| game.id == id) else {
+            return;
+        };
+        if let GameOrigin::Installed(stored) = &self.games[index].origin {
+            let Some(store) = &self.profile_store else {
+                self.library_error = Some("The profile database is unavailable.".to_owned());
+                return;
+            };
+            if let Err(error) = store.delete(stored.id) {
+                self.library_error = Some(error.to_string());
+                return;
+            }
+        }
+
+        self.games.remove(index);
+        self.library_error = None;
+        self.refresh_games_list();
+    }
+
+    fn move_game(&mut self, id: LibraryGameId, direction: MoveDirection) {
+        let Some(index) = self.games.iter().position(|game| game.id == id) else {
+            return;
+        };
+        let Some(target) = moved_index(self.games.len(), index, direction) else {
+            return;
+        };
+        self.games.swap(index, target);
+
+        if let Some(store) = &self.profile_store {
+            let ids: Vec<i64> = self
+                .games
+                .iter()
+                .filter_map(|game| match &game.origin {
+                    GameOrigin::Installed(stored) => Some(stored.id),
+                    GameOrigin::Vndb(_) => None,
+                })
+                .collect();
+            if let Err(error) = store.reorder(&ids) {
+                self.games.swap(index, target);
+                self.library_error = Some(error.to_string());
+                self.refresh_games_list();
+                return;
+            }
+        }
+
+        self.library_error = None;
+        self.refresh_games_list();
     }
 
     fn show_search(&mut self) {
@@ -1267,8 +1389,13 @@ impl App {
             self.games_grid.remove(&child);
         }
 
-        for game in &self.games {
-            self.games_grid.append(&build_game_card(game));
+        for (index, game) in self.games.iter().enumerate() {
+            self.games_grid.append(&build_game_card(
+                game,
+                self.sender.clone(),
+                index > 0,
+                index + 1 < self.games.len(),
+            ));
         }
         self.games_grid
             .set_visible(self.games_grid.first_child().is_some());
@@ -1318,6 +1445,58 @@ fn set_path_choices(dropdown: &gtk::DropDown, paths: &[PathBuf]) {
 
 fn selected_path(paths: &[PathBuf], dropdown: &gtk::DropDown) -> Option<PathBuf> {
     paths.get(dropdown.selected() as usize).cloned()
+}
+
+fn moved_index(length: usize, index: usize, direction: MoveDirection) -> Option<usize> {
+    match direction {
+        MoveDirection::Previous => index.checked_sub(1),
+        MoveDirection::Next if index + 1 < length => Some(index + 1),
+        MoveDirection::Next => None,
+    }
+}
+
+fn show_remove_game_confirmation(
+    root: &adw::ApplicationWindow,
+    sender: ComponentSender<App>,
+    id: LibraryGameId,
+    title: &str,
+) {
+    let window = gtk::Window::builder()
+        .transient_for(root)
+        .modal(true)
+        .title("Remove from library")
+        .resizable(false)
+        .build();
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    content.set_margin_all(18);
+    let heading = gtk::Label::new(Some(&format!("Remove “{title}”?")));
+    heading.set_xalign(0.0);
+    heading.add_css_class("heading");
+    content.append(&heading);
+    let description = gtk::Label::new(Some(
+        "This removes the library entry and saved profile. Installed files and the Wine prefix remain on disk.",
+    ));
+    description.set_xalign(0.0);
+    description.set_wrap(true);
+    content.append(&description);
+
+    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    buttons.set_halign(gtk::Align::End);
+    let cancel = gtk::Button::with_label("Cancel");
+    let remove = gtk::Button::with_label("Remove");
+    remove.add_css_class("destructive-action");
+    let cancel_window = window.clone();
+    cancel.connect_clicked(move |_| cancel_window.close());
+    let remove_window = window.clone();
+    remove.connect_clicked(move |_| {
+        remove_window.close();
+        sender.input(AppMsg::ConfirmRemoveGame(id));
+    });
+    buttons.append(&cancel);
+    buttons.append(&remove);
+    content.append(&buttons);
+    window.set_child(Some(&content));
+    window.present();
 }
 
 fn show_executable_chooser(
@@ -1468,7 +1647,12 @@ async fn search_with_thumbnails(
     })
 }
 
-fn build_game_card(game: &LibraryGame) -> gtk::Box {
+fn build_game_card(
+    game: &LibraryGame,
+    sender: ComponentSender<App>,
+    can_move_previous: bool,
+    can_move_next: bool,
+) -> gtk::Box {
     let card = gtk::Box::new(gtk::Orientation::Vertical, 8);
     card.add_css_class("card");
     card.add_css_class("library-card");
@@ -1505,16 +1689,62 @@ fn build_game_card(game: &LibraryGame) -> gtk::Box {
     subtitle.add_css_class("caption");
     card.append(&subtitle);
 
+    if matches!(&game.origin, GameOrigin::Installed(_)) {
+        let play = gtk::Button::with_label("Play");
+        play.add_css_class("suggested-action");
+        let play_sender = sender.clone();
+        let id = game.id;
+        play.connect_clicked(move |_| play_sender.input(AppMsg::LaunchGame(id)));
+        card.append(&play);
+    }
+
+    let controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    controls.set_halign(gtk::Align::Center);
+
+    let previous = gtk::Button::from_icon_name("go-previous-symbolic");
+    previous.set_tooltip_text(Some("Move earlier"));
+    previous.set_sensitive(can_move_previous);
+    let previous_sender = sender.clone();
+    let id = game.id;
+    previous.connect_clicked(move |_| {
+        previous_sender.input(AppMsg::MoveGame {
+            id,
+            direction: MoveDirection::Previous,
+        });
+    });
+    controls.append(&previous);
+
+    let next = gtk::Button::from_icon_name("go-next-symbolic");
+    next.set_tooltip_text(Some("Move later"));
+    next.set_sensitive(can_move_next);
+    let next_sender = sender.clone();
+    let id = game.id;
+    next.connect_clicked(move |_| {
+        next_sender.input(AppMsg::MoveGame {
+            id,
+            direction: MoveDirection::Next,
+        });
+    });
+    controls.append(&next);
+
+    let remove = gtk::Button::from_icon_name("user-trash-symbolic");
+    remove.set_tooltip_text(Some("Remove from library"));
+    remove.add_css_class("destructive-action");
+    let id = game.id;
+    remove.connect_clicked(move |_| sender.input(AppMsg::RequestRemoveGame(id)));
+    controls.append(&remove);
+    card.append(&controls);
+
     card
 }
 
 fn game_subtitle(game: &LibraryGame) -> String {
     match &game.origin {
-        GameOrigin::Installed(profile) => format!(
+        GameOrigin::Installed(stored) => format!(
             "{} {}\n{}",
-            profile.runner.as_str(),
-            profile.arch.as_str(),
-            profile.exe.display()
+            stored.profile.runner.as_str(),
+            stored.profile.arch.as_str(),
+            stored.profile.exe.display()
         ),
         GameOrigin::Vndb(summary) => {
             let mut subtitle = summary.id.clone();
@@ -1709,13 +1939,15 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::{
-        profile::{LaunchProfile, PrefixArch, Runner},
+        profile::{LaunchProfile, PrefixArch, Runner, StoredProfile},
         stages::identify::{IdentifiedSource, SourceKind},
         vndb::VnSummary,
     };
     use relm4::gtk::{self, prelude::*};
 
-    use super::{GameOrigin, LibraryGame, result_subtitle};
+    use super::{
+        GameOrigin, LibraryGame, LibraryGameId, MoveDirection, moved_index, result_subtitle,
+    };
 
     #[test]
     fn formats_original_title_and_release_for_result_rows() {
@@ -1761,20 +1993,6 @@ mod tests {
             .expect("decode cover");
         assert_eq!(texture.width(), super::COVER_WIDTH);
         assert_eq!(texture.height(), super::COVER_HEIGHT);
-
-        let card = super::build_game_card(&super::LibraryGame {
-            title: "Primary".to_owned(),
-            origin: super::GameOrigin::Vndb(VnSummary {
-                id: "v1".to_owned(),
-                title: "Primary".to_owned(),
-                alttitle: None,
-                released: None,
-                image: None,
-            }),
-            thumbnail: None,
-        });
-        assert!(card.has_css_class("library-card"));
-        assert!(card.has_css_class("card"));
     }
 
     #[test]
@@ -1789,18 +2007,24 @@ mod tests {
 
     #[test]
     fn installed_game_card_uses_the_saved_launch_profile() {
+        let profile = LaunchProfile {
+            exe: PathBuf::from("/games/prefix/drive_c/Game/game.exe"),
+            prefix: PathBuf::from("/games/prefix"),
+            arch: PrefixArch::Win32,
+            runner: Runner::Wine,
+            locale: "ja_JP.UTF-8".to_owned(),
+            disc: None,
+            winetricks: Vec::new(),
+            vndb_id: None,
+            notes: String::new(),
+        };
         let game = LibraryGame {
+            id: LibraryGameId::Profile(7),
             title: "Subarashiki Hibi".to_owned(),
-            origin: GameOrigin::Installed(LaunchProfile {
-                exe: PathBuf::from("/games/prefix/drive_c/Game/game.exe"),
-                prefix: PathBuf::from("/games/prefix"),
-                arch: PrefixArch::Win32,
-                runner: Runner::Wine,
-                locale: "ja_JP.UTF-8".to_owned(),
-                disc: None,
-                winetricks: Vec::new(),
-                vndb_id: None,
-                notes: String::new(),
+            origin: GameOrigin::Installed(StoredProfile {
+                id: 7,
+                title: "Subarashiki Hibi".to_owned(),
+                profile,
             }),
             thumbnail: None,
         };
@@ -1814,6 +2038,7 @@ mod tests {
     #[test]
     fn vndb_add_records_metadata_without_local_files() {
         let game = LibraryGame {
+            id: LibraryGameId::Temporary(1),
             title: "Primary".to_owned(),
             origin: GameOrigin::Vndb(VnSummary {
                 id: "v1".to_owned(),
@@ -1829,6 +2054,14 @@ mod tests {
             super::game_subtitle(&game),
             "v1 · 2010-03-26\nNo local files"
         );
+    }
+
+    #[test]
+    fn library_move_stays_within_grid_boundaries() {
+        assert_eq!(moved_index(3, 1, MoveDirection::Previous), Some(0));
+        assert_eq!(moved_index(3, 1, MoveDirection::Next), Some(2));
+        assert_eq!(moved_index(3, 0, MoveDirection::Previous), None);
+        assert_eq!(moved_index(3, 2, MoveDirection::Next), None);
     }
 
     #[test]
