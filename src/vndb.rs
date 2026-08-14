@@ -4,6 +4,7 @@ use thiserror::Error;
 
 const KANA_VN_ENDPOINT: &str = "https://api.vndb.org/kana/vn";
 const RESULT_LIMIT: u8 = 10;
+const USER_AGENT: &str = concat!("ryoiki/", env!("CARGO_PKG_VERSION"));
 
 #[derive(Clone, Debug)]
 pub struct VndbClient {
@@ -12,11 +13,17 @@ pub struct VndbClient {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct VnImage {
+    pub thumbnail: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct VnSummary {
     pub id: String,
     pub title: String,
     pub alttitle: Option<String>,
     pub released: Option<String>,
+    pub image: Option<VnImage>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -79,7 +86,7 @@ impl VndbClient {
 
         let request = SearchRequest {
             filters: ["search", "=", query],
-            fields: "title,alttitle,released",
+            fields: "title,alttitle,released,image.thumbnail",
             sort: "searchrank",
             results: RESULT_LIMIT,
         };
@@ -87,10 +94,7 @@ impl VndbClient {
         let response = self
             .http
             .post(&self.endpoint)
-            .header(
-                reqwest::header::USER_AGENT,
-                concat!("ryoiki/", env!("CARGO_PKG_VERSION")),
-            )
+            .header(reqwest::header::USER_AGENT, USER_AGENT)
             .json(&request)
             .send()
             .await?;
@@ -109,6 +113,18 @@ impl VndbClient {
             entries: response.results,
             more: response.more,
         })
+    }
+
+    pub async fn fetch_thumbnail(&self, url: &str) -> Result<Vec<u8>, VndbError> {
+        let response = self
+            .http
+            .get(url)
+            .header(reqwest::header::USER_AGENT, USER_AGENT)
+            .send()
+            .await?
+            .error_for_status()?;
+
+        Ok(response.bytes().await?.to_vec())
     }
 }
 
@@ -132,7 +148,10 @@ fn api_error_message(body: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use httpmock::{Method::POST, MockServer};
+    use httpmock::{
+        Method::{GET, POST},
+        MockServer,
+    };
     use serde_json::json;
 
     use super::{VndbClient, VndbError};
@@ -143,7 +162,7 @@ mod tests {
         let search = server.mock(|when, then| {
             when.method(POST).path("/vn").json_body(json!({
                 "filters": ["search", "=", "Subarashiki Hibi"],
-                "fields": "title,alttitle,released",
+                "fields": "title,alttitle,released,image.thumbnail",
                 "sort": "searchrank",
                 "results": 10
             }));
@@ -152,10 +171,19 @@ mod tests {
                     "id": "v3144",
                     "title": "Subarashiki Hibi ~Furenzoku Sonzai~",
                     "alttitle": "素晴らしき日々 ～不連続存在～",
-                    "released": "2010-03-26"
+                    "released": "2010-03-26",
+                    "image": {
+                        "thumbnail": server.url("/cover.jpg")
+                    }
                 }],
                 "more": false
             }));
+        });
+        let thumbnail = server.mock(|when, then| {
+            when.method(GET).path("/cover.jpg");
+            then.status(200)
+                .header("content-type", "image/jpeg")
+                .body([0xff, 0xd8, 0xff, 0xd9]);
         });
         let client = VndbClient::with_endpoint(server.url("/vn"));
 
@@ -168,6 +196,17 @@ mod tests {
         assert_eq!(results.entries.len(), 1);
         assert_eq!(results.entries[0].id, "v3144");
         assert_eq!(results.entries[0].released.as_deref(), Some("2010-03-26"));
+        let thumbnail_url = &results.entries[0]
+            .image
+            .as_ref()
+            .expect("result should include image metadata")
+            .thumbnail;
+        let thumbnail_bytes = client
+            .fetch_thumbnail(thumbnail_url)
+            .await
+            .expect("thumbnail should download");
+        thumbnail.assert();
+        assert_eq!(thumbnail_bytes, [0xff, 0xd8, 0xff, 0xd9]);
         assert!(!results.more);
     }
 

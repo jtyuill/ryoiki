@@ -149,6 +149,6 @@ Mounting and mapping a disc the user already has is in scope.
 
 - Native Relm4/libadwaita shell with Setup and VNDB pages
 - Source classification for archives, disc images, folders, and Windows executables
-- VNDB Kana title search with native result rendering
+- VNDB Kana title search with native cover result rows; thumbnails are in-memory only
 
 Next setup work is `extract → prefix → present disc`. VNDB stays an isolated lookup until a launch profile can be saved.

@@ -1,10 +1,12 @@
+use futures_util::future::join_all;
+
 use std::path::PathBuf;
 
 use relm4::{Component, ComponentParts, ComponentSender, RelmWidgetExt, adw, adw::prelude::*, gtk};
 
 use crate::{
     stages::identify::{IdentifiedSource, identify_source},
-    vndb::{VnSummary, VndbClient, VndbError, VndbSearchResults},
+    vndb::{VnSummary, VndbClient, VndbError},
 };
 
 pub struct App {
@@ -13,6 +15,7 @@ pub struct App {
     query: String,
     search: SearchState,
     vndb: VndbClient,
+    results_list: gtk::ListBox,
 }
 
 #[derive(Debug)]
@@ -28,7 +31,7 @@ pub enum AppMsg {
 pub enum CommandOutput {
     SearchFinished {
         query: String,
-        result: Result<VndbSearchResults, VndbError>,
+        result: Result<SearchDisplayResults, VndbError>,
     },
 }
 
@@ -39,13 +42,25 @@ enum SearchState {
     },
     Loaded {
         query: String,
-        entries: Vec<VnSummary>,
+        count: usize,
         more: bool,
     },
     Failed {
         query: String,
         message: String,
     },
+}
+
+#[derive(Debug)]
+pub struct SearchDisplayResults {
+    entries: Vec<SearchResultWithThumbnail>,
+    more: bool,
+}
+
+#[derive(Debug)]
+struct SearchResultWithThumbnail {
+    summary: VnSummary,
+    thumbnail: Option<Vec<u8>>,
 }
 
 #[relm4::component(pub)]
@@ -215,8 +230,9 @@ impl Component for App {
                         set_xalign: 0.0,
                         set_yalign: 0.0,
                         set_wrap: true,
-                        set_selectable: true,
                     },
+
+                    append: &model.results_list,
                 },
             },
         },
@@ -227,12 +243,18 @@ impl Component for App {
         root: Self::Root,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
+        let results_list = gtk::ListBox::new();
+        results_list.set_selection_mode(gtk::SelectionMode::None);
+        results_list.add_css_class("boxed-list");
+        results_list.set_visible(false);
+
         let model = Self {
             source: None,
             source_error: None,
             query: String::new(),
             search: SearchState::Idle,
             vndb: VndbClient::new(),
+            results_list,
         };
         let widgets = view_output!();
 
@@ -267,11 +289,12 @@ impl Component for App {
 
                 let query = self.query.trim().to_owned();
                 let client = self.vndb.clone();
+                self.replace_search_results(Vec::new());
                 self.search = SearchState::Loading {
                     query: query.clone(),
                 };
                 sender.oneshot_command(async move {
-                    let result = client.search(&query).await;
+                    let result = search_with_thumbnails(client, &query).await;
                     CommandOutput::SearchFinished { query, result }
                 });
             }
@@ -285,19 +308,24 @@ impl Component for App {
         _root: &Self::Root,
     ) {
         match message {
-            CommandOutput::SearchFinished { query, result } => {
-                self.search = match result {
-                    Ok(results) => SearchState::Loaded {
+            CommandOutput::SearchFinished { query, result } => match result {
+                Ok(results) => {
+                    let count = results.entries.len();
+                    self.replace_search_results(results.entries);
+                    self.search = SearchState::Loaded {
                         query,
-                        entries: results.entries,
+                        count,
                         more: results.more,
-                    },
-                    Err(error) => SearchState::Failed {
+                    };
+                }
+                Err(error) => {
+                    self.replace_search_results(Vec::new());
+                    self.search = SearchState::Failed {
                         query,
                         message: error.to_string(),
-                    },
-                };
-            }
+                    };
+                }
+            },
         }
     }
 }
@@ -338,14 +366,35 @@ impl App {
             SearchState::Idle => "Enter a title to query VNDB.".to_owned(),
             SearchState::Loading { query } => format!("Searching for “{query}”…"),
             SearchState::Loaded {
-                query,
-                entries,
-                more,
-            } => format_search_results(query, entries, *more),
+                query, count: 0, ..
+            } => {
+                format!("No VNDB results for “{query}”.")
+            }
+            SearchState::Loaded { query, count, more } => {
+                let noun = if *count == 1 { "result" } else { "results" };
+                let suffix = if *more {
+                    " More matches are available."
+                } else {
+                    ""
+                };
+                format!("{count} {noun} for “{query}”.{suffix}")
+            }
             SearchState::Failed { query, message } => {
                 format!("Search for “{query}” failed.\n\n{message}")
             }
         }
+    }
+
+    fn replace_search_results(&self, entries: Vec<SearchResultWithThumbnail>) {
+        while let Some(child) = self.results_list.first_child() {
+            self.results_list.remove(&child);
+        }
+
+        for entry in entries {
+            self.results_list.append(&build_result_row(entry));
+        }
+        self.results_list
+            .set_visible(self.results_list.first_child().is_some());
     }
 }
 
@@ -391,64 +440,90 @@ fn show_source_chooser(
     chooser.show();
 }
 
-fn format_search_results(query: &str, entries: &[VnSummary], more: bool) -> String {
-    if entries.is_empty() {
-        return format!("No VNDB results for “{query}”.");
-    }
-
-    let mut output = format!("Results for “{query}”\n\n");
-    for entry in entries {
-        output.push_str(&entry.title);
-        if let Some(alternative) = &entry.alttitle
-            && alternative != &entry.title
-        {
-            output.push('\n');
-            output.push_str(alternative);
+async fn search_with_thumbnails(
+    client: VndbClient,
+    query: &str,
+) -> Result<SearchDisplayResults, VndbError> {
+    let results = client.search(query).await?;
+    let downloads = results.entries.into_iter().map(|summary| {
+        let client = client.clone();
+        async move {
+            let thumbnail = match &summary.image {
+                Some(image) => client.fetch_thumbnail(&image.thumbnail).await.ok(),
+                None => None,
+            };
+            SearchResultWithThumbnail { summary, thumbnail }
         }
-        output.push('\n');
-        output.push_str(&entry.id);
-        if let Some(released) = &entry.released {
-            output.push_str(" · ");
-            output.push_str(released);
-        }
-        output.push_str("\n\n");
-    }
+    });
 
-    if more {
-        output.push_str("More matches are available on VNDB.");
-    }
+    Ok(SearchDisplayResults {
+        entries: join_all(downloads).await,
+        more: results.more,
+    })
+}
 
-    output.trim_end().to_owned()
+fn build_result_row(entry: SearchResultWithThumbnail) -> adw::ActionRow {
+    let row = adw::ActionRow::new();
+    row.set_title(&entry.summary.title);
+    row.set_subtitle(&result_subtitle(&entry.summary));
+    let alternative_text = format!("Cover for {}", entry.summary.title);
+
+    let cover: gtk::Widget = entry
+        .thumbnail
+        .and_then(|thumbnail| {
+            let bytes = gtk::glib::Bytes::from_owned(thumbnail);
+            gtk::gdk::Texture::from_bytes(&bytes).ok()
+        })
+        .map(|texture| {
+            let picture = gtk::Picture::for_paintable(&texture);
+            picture.set_alternative_text(Some(&alternative_text));
+            picture.set_can_shrink(true);
+            picture.set_size_request(72, 100);
+            picture.upcast()
+        })
+        .unwrap_or_else(|| {
+            let image = gtk::Image::from_icon_name("image-missing-symbolic");
+            image.set_pixel_size(32);
+            image.set_size_request(72, 100);
+            image.add_css_class("dim-label");
+            image.upcast()
+        });
+    row.add_prefix(&cover);
+    row
+}
+
+fn result_subtitle(entry: &VnSummary) -> String {
+    let mut subtitle = String::new();
+    if let Some(alternative) = &entry.alttitle
+        && alternative != &entry.title
+    {
+        subtitle.push_str(alternative);
+        subtitle.push('\n');
+    }
+    subtitle.push_str(&entry.id);
+    if let Some(released) = &entry.released {
+        subtitle.push_str(" · ");
+        subtitle.push_str(released);
+    }
+    subtitle
 }
 
 #[cfg(test)]
 mod tests {
     use crate::vndb::VnSummary;
 
-    use super::format_search_results;
+    use super::result_subtitle;
 
     #[test]
-    fn formats_primary_and_original_titles_without_duplicate_titles() {
-        let entries = vec![
-            VnSummary {
-                id: "v1".to_owned(),
-                title: "Primary".to_owned(),
-                alttitle: Some("原題".to_owned()),
-                released: Some("2025".to_owned()),
-            },
-            VnSummary {
-                id: "v2".to_owned(),
-                title: "Same".to_owned(),
-                alttitle: Some("Same".to_owned()),
-                released: None,
-            },
-        ];
+    fn formats_original_title_and_release_for_result_rows() {
+        let entry = VnSummary {
+            id: "v1".to_owned(),
+            title: "Primary".to_owned(),
+            alttitle: Some("原題".to_owned()),
+            released: Some("2025".to_owned()),
+            image: None,
+        };
 
-        let formatted = format_search_results("query", &entries, true);
-
-        assert!(formatted.contains("Primary\n原題\nv1 · 2025"));
-        assert!(formatted.contains("Same\nv2"));
-        assert!(!formatted.contains("Same\nSame"));
-        assert!(formatted.ends_with("More matches are available on VNDB."));
+        assert_eq!(result_subtitle(&entry), "原題\nv1 · 2025");
     }
 }
