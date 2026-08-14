@@ -147,8 +147,10 @@ Mounting and mapping a disc the user already has is in scope.
 
 ## Current implementation
 
-- Native Relm4/libadwaita shell with Setup and VNDB pages
+- Native Relm4/libadwaita library home. Add game → archive or folder
 - Source classification for archives, disc images, folders, and Windows executables
-- VNDB Kana title search with native cover result rows; thumbnails are in-memory only
+- File-name autodetect, then VNDB Kana search with in-memory cover thumbnails
+- In-memory library list only; no persistence or launch yet
 
-Next setup work is `extract → prefix → present disc`. VNDB stays an isolated lookup until a launch profile can be saved.
+Next setup work is `extract → prefix → present disc`. Library launch still waits on a saved profile.
+
