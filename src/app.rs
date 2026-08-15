@@ -299,6 +299,8 @@ impl Component for App {
                 set_orientation: gtk::Orientation::Vertical,
                 set_spacing: 18,
                 set_margin_all: 24,
+                set_vexpand: false,
+                set_valign: gtk::Align::Start,
 
                 adw::StatusPage {
                     set_icon_name: Some("folder-documents-symbolic"),
@@ -565,13 +567,14 @@ impl Component for App {
     ) -> ComponentParts<Self> {
         let games_grid = gtk::FlowBox::new();
         games_grid.set_selection_mode(gtk::SelectionMode::None);
-        games_grid.set_homogeneous(true);
+        games_grid.set_homogeneous(false);
         games_grid.set_min_children_per_line(1);
         games_grid.set_max_children_per_line(8);
         games_grid.set_column_spacing(12);
         games_grid.set_row_spacing(12);
         games_grid.set_valign(gtk::Align::Start);
         games_grid.set_hexpand(true);
+        games_grid.set_vexpand(false);
         games_grid.set_visible(false);
 
         let query_entry = gtk::Entry::new();
@@ -1586,6 +1589,10 @@ impl App {
                 index > 0,
                 index + 1 < self.games.len(),
             ));
+            if let Some(child) = self.games_grid.last_child() {
+                child.set_vexpand(false);
+                child.set_valign(gtk::Align::Start);
+            }
         }
         self.games_grid
             .set_visible(self.games_grid.first_child().is_some());
@@ -2096,7 +2103,10 @@ fn build_game_card(
     card.add_css_class("card");
     card.add_css_class("library-card");
     card.set_hexpand(false);
-    card.set_halign(gtk::Align::Center);
+    card.set_vexpand(false);
+    card.set_halign(gtk::Align::Fill);
+    card.set_valign(gtk::Align::Start);
+    card.set_size_request(196, -1);
 
     card.append(&cover_widget(
         game.thumbnail.clone(),
@@ -2115,26 +2125,43 @@ fn build_game_card(
     title.set_lines(2);
     title.set_ellipsize(gtk::pango::EllipsizeMode::End);
     title.add_css_class("heading");
+    title.add_css_class("library-title");
+    title.set_hexpand(true);
+    title.set_vexpand(false);
+    title.set_valign(gtk::Align::Start);
+    title.set_yalign(0.5);
     card.append(&title);
 
     if !edit_mode {
-        if game.profile.is_some() {
+        let action = if game.profile.is_some() {
             let play = gtk::Button::with_label("Play");
             play.add_css_class("suggested-action");
             let id = game.id;
             play.connect_clicked(move |_| sender.input(AppMsg::LaunchGame(id)));
-            card.append(&play);
+            play
         } else {
             let files = gtk::Button::with_label("Choose game files");
             let id = game.id;
             files.connect_clicked(move |_| sender.input(AppMsg::ChooseGameFiles(id)));
-            card.append(&files);
+            files
+        };
+        action.add_css_class("library-action");
+        action.set_hexpand(true);
+        action.set_vexpand(false);
+        action.set_valign(gtk::Align::Start);
+        if let Some(label) = action.child().and_downcast::<gtk::Label>() {
+            label.set_wrap(false);
+            label.set_single_line_mode(true);
         }
-        return card;
+        card.append(&action);
+        card.append(&library_card_spacer());
+        return wrap_library_card(card);
     }
-
     let controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     controls.set_halign(gtk::Align::Center);
+    controls.set_hexpand(true);
+    controls.set_vexpand(false);
+    controls.set_valign(gtk::Align::End);
 
     let previous = gtk::Button::from_icon_name("go-previous-symbolic");
     previous.set_tooltip_text(Some("Move earlier"));
@@ -2176,8 +2203,26 @@ fn build_game_card(
     remove.connect_clicked(move |_| sender.input(AppMsg::RequestRemoveGame(id)));
     controls.append(&remove);
     card.append(&controls);
+    card.append(&library_card_spacer());
 
-    card
+    wrap_library_card(card)
+}
+
+fn wrap_library_card(card: gtk::Box) -> gtk::Box {
+    let wrapper = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    wrapper.set_hexpand(true);
+    wrapper.set_vexpand(false);
+    wrapper.set_halign(gtk::Align::Fill);
+    wrapper.set_valign(gtk::Align::Start);
+    wrapper.append(&card);
+    wrapper
+}
+
+fn library_card_spacer() -> gtk::Box {
+    let spacer = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    spacer.set_vexpand(true);
+    spacer.set_hexpand(false);
+    spacer
 }
 
 fn build_result_row(
@@ -2208,22 +2253,26 @@ fn cover_widget(
     height: i32,
     css_class: &str,
 ) -> gtk::Widget {
-    thumbnail
-        .and_then(|bytes| thumbnail_texture(bytes, width, height))
-        .map(|texture| {
-            let picture = gtk::Picture::for_paintable(&texture);
-            picture.set_alternative_text(Some(alternative_text));
-            picture.set_can_shrink(true);
-            apply_cover_slot(&picture, width, height, css_class);
-            picture.upcast()
-        })
-        .unwrap_or_else(|| {
-            let image = gtk::Image::from_icon_name("image-missing-symbolic");
-            image.set_pixel_size(32);
-            image.add_css_class("dim-label");
-            apply_cover_slot(&image, width, height, css_class);
-            image.upcast()
-        })
+    let slot = gtk::Fixed::new();
+    apply_cover_slot(&slot, width, height, css_class);
+    slot.set_overflow(gtk::Overflow::Hidden);
+
+    if let Some(texture) = thumbnail.and_then(|bytes| thumbnail_texture(bytes, width, height)) {
+        let picture = gtk::Picture::for_paintable(&texture);
+        picture.set_alternative_text(Some(alternative_text));
+        picture.set_can_shrink(true);
+        picture.set_keep_aspect_ratio(false);
+        picture.set_size_request(width, height);
+        slot.put(&picture, 0.0, 0.0);
+    } else {
+        let image = gtk::Image::from_icon_name("image-missing-symbolic");
+        image.set_pixel_size(32);
+        image.add_css_class("dim-label");
+        image.set_size_request(width, height);
+        slot.put(&image, 0.0, 0.0);
+    }
+
+    slot.upcast()
 }
 
 fn thumbnail_texture(thumbnail: Vec<u8>, width: i32, height: i32) -> Option<gtk::gdk::Texture> {
@@ -2245,7 +2294,7 @@ fn apply_cover_slot(
     widget.set_hexpand(false);
     widget.set_vexpand(false);
     widget.set_halign(gtk::Align::Center);
-    widget.set_valign(gtk::Align::Center);
+    widget.set_valign(gtk::Align::Start);
     widget.add_css_class(css_class);
 }
 
@@ -2341,10 +2390,32 @@ mod tests {
                 .expect("pixbuf");
         pixbuf.fill(0x3366_99ff);
         let png = pixbuf.save_to_bufferv("png", &[]).expect("encode png");
-        let texture = super::thumbnail_texture(png, super::COVER_WIDTH, super::COVER_HEIGHT)
+        let texture = super::thumbnail_texture(png.clone(), super::COVER_WIDTH, super::COVER_HEIGHT)
             .expect("decode cover");
         assert_eq!(texture.width(), super::COVER_WIDTH);
         assert_eq!(texture.height(), super::COVER_HEIGHT);
+
+        let missing = super::cover_widget(
+            None,
+            "Cover for Missing",
+            super::CARD_COVER_WIDTH,
+            super::CARD_COVER_HEIGHT,
+            "library-cover",
+        );
+        assert_eq!(missing.width_request(), super::CARD_COVER_WIDTH);
+        assert_eq!(missing.height_request(), super::CARD_COVER_HEIGHT);
+        assert!(missing.has_css_class("library-cover"));
+
+        let present = super::cover_widget(
+            Some(png),
+            "Cover for Present",
+            super::CARD_COVER_WIDTH,
+            super::CARD_COVER_HEIGHT,
+            "library-cover",
+        );
+        assert_eq!(present.width_request(), super::CARD_COVER_WIDTH);
+        assert_eq!(present.height_request(), super::CARD_COVER_HEIGHT);
+        assert!(present.has_css_class("library-cover"));
     }
 
     #[test]
