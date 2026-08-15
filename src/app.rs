@@ -1,6 +1,7 @@
 use futures_util::future::join_all;
 
 use std::{
+    fs,
     path::{Path, PathBuf},
     thread,
 };
@@ -8,7 +9,9 @@ use std::{
 use relm4::{Component, ComponentParts, ComponentSender, RelmWidgetExt, adw, adw::prelude::*, gtk};
 
 use crate::{
-    profile::{PrefixArch, ProfileError, ProfileStore, StoredProfile, data_root},
+    profile::{
+        GameMetadata, LibraryError, LibraryStore, PrefixArch, StoredGame, StoredProfile, data_root,
+    },
     stages::{
         identify::{IdentifiedSource, SourceKind, identify_source},
         install::{
@@ -29,6 +32,7 @@ pub struct App {
     page: Page,
     games: Vec<LibraryGame>,
     library_error: Option<String>,
+    library_edit_mode: bool,
     query: String,
     search: SearchState,
     vndb: VndbClient,
@@ -37,14 +41,15 @@ pub struct App {
     query_entry: gtk::Entry,
     results_list: gtk::ListBox,
     wizard: Option<InstallWizard>,
-    profile_store: Option<ProfileStore>,
+    library_store: Option<LibraryStore>,
     data_root: Option<PathBuf>,
     wizard_title_entry: gtk::Entry,
     wizard_arch_dropdown: gtk::DropDown,
     wizard_disc_dropdown: gtk::DropDown,
     wizard_installer_dropdown: gtk::DropDown,
     wizard_executable_dropdown: gtk::DropDown,
-    next_temporary_game_id: u64,
+    search_target: Option<LibraryGameId>,
+    install_target: Option<LibraryGameId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -73,10 +78,7 @@ impl Page {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LibraryGameId {
-    Profile(i64),
-    Temporary(u64),
-}
+pub struct LibraryGameId(pub i64);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MoveDirection {
@@ -87,15 +89,9 @@ pub enum MoveDirection {
 #[derive(Clone, Debug)]
 struct LibraryGame {
     id: LibraryGameId,
-    title: String,
-    origin: GameOrigin,
+    metadata: GameMetadata,
+    profile: Option<StoredProfile>,
     thumbnail: Option<Vec<u8>>,
-}
-
-#[derive(Clone, Debug)]
-enum GameOrigin {
-    Installed(StoredProfile),
-    Vndb(VnSummary),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -124,10 +120,10 @@ struct InstallWizard {
 
 #[derive(Debug)]
 pub enum AppMsg {
-    AddLocal,
     ChooseSourceFile,
     ChooseSourceFolder,
     SourceSelected(PathBuf),
+    ChooseGameFiles(LibraryGameId),
     WizardTitleChanged(String),
     WizardPrimary,
     WizardBrowseExecutable,
@@ -143,18 +139,32 @@ pub enum AppMsg {
     },
     ProfileSaved {
         outcome: InstallOutcome,
-        result: Result<StoredProfile, ProfileError>,
+        result: Result<StoredProfile, LibraryError>,
     },
     LaunchGame(LibraryGameId),
     GameFinished {
         title: String,
         result: Result<(), LaunchError>,
     },
+    ToggleLibraryEditMode,
     RequestRemoveGame(LibraryGameId),
     ConfirmRemoveGame(LibraryGameId),
+    ConfirmDeleteGameFiles(LibraryGameId),
+    GameRemovalFinished {
+        id: LibraryGameId,
+        result: Result<Option<String>, String>,
+    },
     MoveGame {
         id: LibraryGameId,
         direction: MoveDirection,
+    },
+    AddVndbOnly(SearchResultWithThumbnail),
+    AddVndbAndFiles(SearchResultWithThumbnail),
+    EditMetadata(LibraryGameId),
+    SearchMetadata(LibraryGameId),
+    SaveManualMetadata {
+        id: LibraryGameId,
+        metadata: GameMetadata,
     },
     ShowSearch,
     QueryChanged(String),
@@ -234,11 +244,19 @@ impl Component for App {
                         add_css_class: "heading",
                     },
 
+                    pack_end = &gtk::Button {
+                        #[watch]
+                        set_label: if model.library_edit_mode { "Done" } else { "Edit" },
+                        #[watch]
+                        set_visible: model.page == Page::Library && !model.games.is_empty(),
+                        connect_clicked => AppMsg::ToggleLibraryEditMode,
+                    },
+
                     pack_end = &gtk::MenuButton {
                         set_icon_name: "list-add-symbolic",
                         set_tooltip_text: Some("Add game"),
                         #[watch]
-                        set_visible: model.page == Page::Library,
+                        set_visible: model.page == Page::Library && !model.library_edit_mode,
 
                         #[wrap(Some)]
                         set_popover = &gtk::Popover {
@@ -247,16 +265,9 @@ impl Component for App {
                                 set_spacing: 6,
                                 set_margin_all: 6,
 
-                                gtk::Button {
-                                    set_label: "Install from files",
-                                    add_css_class: "flat",
-                                    connect_clicked => AppMsg::AddLocal,
-                                },
-
-                                gtk::Separator {},
 
                                 gtk::Button {
-                                    set_label: "Search VNDB",
+                                    set_label: "Add from VNDB",
                                     add_css_class: "flat",
                                     connect_clicked => AppMsg::ShowSearch,
                                 },
@@ -292,7 +303,7 @@ impl Component for App {
                 adw::StatusPage {
                     set_icon_name: Some("folder-documents-symbolic"),
                     set_title: "No games yet",
-                    set_description: Some("Press + to install from local files or add a VNDB title."),
+                    set_description: Some("Press + to add a VNDB title to the library."),
                     #[watch]
                     set_visible: model.games.is_empty(),
                 },
@@ -327,13 +338,15 @@ impl Component for App {
                     set_margin_all: 32,
 
                     gtk::Label {
-                        set_label: "Add from VNDB",
+                        #[watch]
+                        set_label: model.search_heading(),
                         set_xalign: 0.0,
                         add_css_class: "title-1",
                     },
 
                     gtk::Label {
-                        set_label: "Search and add a title. No local files will be installed.",
+                        #[watch]
+                        set_label: model.search_description(),
                         set_xalign: 0.0,
                         set_wrap: true,
                         add_css_class: "dim-label",
@@ -427,7 +440,7 @@ impl Component for App {
                         set_visible: model.wizard_phase_is(WizardPhase::Review),
 
                         gtk::Label {
-                            set_label: "Game title",
+                            set_label: "Library title",
                             set_xalign: 0.0,
                             add_css_class: "heading",
                         },
@@ -580,6 +593,7 @@ impl Component for App {
 
         let wizard_title_entry = gtk::Entry::new();
         wizard_title_entry.set_hexpand(true);
+        wizard_title_entry.set_editable(false);
         let title_sender = sender.clone();
         wizard_title_entry.connect_changed(move |entry| {
             title_sender.input(AppMsg::WizardTitleChanged(entry.text().to_string()));
@@ -600,22 +614,14 @@ impl Component for App {
         let wizard_executable_dropdown = gtk::DropDown::from_strings(&[]);
         wizard_executable_dropdown.set_enable_search(true);
 
-        let (application_data_root, profile_store, games, library_error) = match data_root() {
+        let (application_data_root, library_store, games, library_error) = match data_root() {
             Ok(root) => {
-                let store = ProfileStore::new(&root);
+                let store = LibraryStore::new(&root);
                 match store.load() {
-                    Ok(profiles) => (
+                    Ok(games) => (
                         Some(root),
                         Some(store),
-                        profiles
-                            .into_iter()
-                            .map(|stored| LibraryGame {
-                                id: LibraryGameId::Profile(stored.id),
-                                title: stored.title.clone(),
-                                origin: GameOrigin::Installed(stored),
-                                thumbnail: None,
-                            })
-                            .collect(),
+                        games.into_iter().map(library_game_from_stored).collect(),
                         None,
                     ),
                     Err(error) => (Some(root), Some(store), Vec::new(), Some(error.to_string())),
@@ -628,6 +634,7 @@ impl Component for App {
             page: Page::Library,
             games,
             library_error,
+            library_edit_mode: false,
             query: String::new(),
             search: SearchState::Idle,
             vndb: VndbClient::new(),
@@ -636,14 +643,15 @@ impl Component for App {
             query_entry,
             results_list,
             wizard: None,
-            profile_store,
+            library_store,
             data_root: application_data_root,
             wizard_title_entry,
             wizard_arch_dropdown,
             wizard_disc_dropdown,
             wizard_installer_dropdown,
             wizard_executable_dropdown,
-            next_temporary_game_id: 1,
+            search_target: None,
+            install_target: None,
         };
         model.refresh_games_list();
         let widgets = view_output!();
@@ -656,7 +664,8 @@ impl Component for App {
             AppMsg::ChooseSourceFile => {
                 show_source_chooser(root, sender, gtk::FileChooserAction::Open);
             }
-            AppMsg::AddLocal => {
+            AppMsg::ChooseGameFiles(id) => {
+                self.install_target = Some(id);
                 show_local_source_prompt(root, sender);
             }
             AppMsg::ChooseSourceFolder => {
@@ -703,16 +712,49 @@ impl Component for App {
                     self.library_error = Some(format!("“{title}” stopped with an error: {error}"));
                 }
             }
+            AppMsg::ToggleLibraryEditMode => {
+                self.library_edit_mode = !self.library_edit_mode;
+                self.refresh_games_list();
+            }
             AppMsg::RequestRemoveGame(id) => {
                 if let Some(game) = self.games.iter().find(|game| game.id == id) {
-                    show_remove_game_confirmation(root, sender, id, &game.title);
+                    show_remove_game_confirmation(
+                        root,
+                        sender,
+                        id,
+                        &game.metadata.title,
+                        game.profile.is_some(),
+                    );
                 }
             }
             AppMsg::ConfirmRemoveGame(id) => {
-                self.remove_game(id);
+                self.start_removing_game(id, false, sender);
+            }
+            AppMsg::ConfirmDeleteGameFiles(id) => {
+                self.start_removing_game(id, true, sender);
+            }
+            AppMsg::GameRemovalFinished { id, result } => {
+                self.game_removal_finished(id, result);
             }
             AppMsg::MoveGame { id, direction } => {
                 self.move_game(id, direction);
+            }
+            AppMsg::AddVndbOnly(entry) => {
+                self.add_vndb_game(entry, false, root, sender);
+            }
+            AppMsg::AddVndbAndFiles(entry) => {
+                self.add_vndb_game(entry, true, root, sender);
+            }
+            AppMsg::EditMetadata(id) => {
+                if let Some(game) = self.games.iter().find(|game| game.id == id) {
+                    show_metadata_editor(root, sender, game);
+                }
+            }
+            AppMsg::SearchMetadata(id) => {
+                self.start_metadata_search(id);
+            }
+            AppMsg::SaveManualMetadata { id, metadata } => {
+                self.save_manual_metadata(id, metadata);
             }
             AppMsg::ShowSearch => {
                 self.show_search();
@@ -724,7 +766,11 @@ impl Component for App {
                 self.start_search(sender);
             }
             AppMsg::SelectMatch(entry) => {
-                self.add_vndb_title(entry);
+                if let Some(target) = self.search_target {
+                    self.replace_metadata_from_vndb(target, entry);
+                } else {
+                    show_vndb_add_choice(root, sender, entry);
+                }
             }
             AppMsg::ShowLibrary => {
                 self.show_library();
@@ -770,11 +816,28 @@ impl App {
         matches!(self.search, SearchState::Loading { .. })
     }
 
+    fn search_heading(&self) -> &'static str {
+        if self.search_target.is_some() {
+            "Change metadata from VNDB"
+        } else {
+            "Add from VNDB"
+        }
+    }
+
+    fn search_description(&self) -> &'static str {
+        if self.search_target.is_some() {
+            "Choose a result to replace this game’s title, release information, and VNDB ID."
+        } else {
+            "Choose a title, then add it to the library or select game files to install."
+        }
+    }
+
     fn search_text(&self) -> String {
         match &self.search {
-            SearchState::Idle => {
-                "Enter a title. Choosing a result adds it without installing files.".to_owned()
+            SearchState::Idle if self.search_target.is_some() => {
+                "Search VNDB and choose the correct metadata.".to_owned()
             }
+            SearchState::Idle => "Search VNDB to add a title.".to_owned(),
             SearchState::Loading { query } => format!("Searching for “{query}”…"),
             SearchState::Loaded {
                 query, count: 0, ..
@@ -788,7 +851,12 @@ impl App {
                 } else {
                     ""
                 };
-                format!("{count} {noun} for “{query}”. Pick one to add.{suffix}")
+                let action = if self.search_target.is_some() {
+                    "use"
+                } else {
+                    "add"
+                };
+                format!("{count} {noun} for “{query}”. Pick one to {action}.{suffix}")
             }
             SearchState::Failed { query, message } => {
                 format!("Search for “{query}” failed.\n\n{message}")
@@ -882,7 +950,7 @@ impl App {
                 !wizard.title.trim().is_empty()
                     && wizard.source.kind != SourceKind::OtherFile
                     && self.data_root.is_some()
-                    && self.profile_store.is_some()
+                    && self.library_store.is_some()
             }
             WizardPhase::ChooseDisc => wizard
                 .prepared_source
@@ -931,12 +999,22 @@ impl App {
     }
 
     fn open_install_wizard(&mut self, path: PathBuf) {
+        let Some(title) = self.install_target.and_then(|id| {
+            self.games
+                .iter()
+                .find(|game| game.id == id)
+                .map(|game| game.metadata.title.clone())
+        }) else {
+            self.library_error = Some("Add the VNDB title before choosing game files.".to_owned());
+            self.page = Page::Library;
+            return;
+        };
         match identify_source(path) {
             Ok(source) => {
-                let title = fallback_title(&source);
+                let title = title;
                 let error = if source.kind == SourceKind::OtherFile {
                     Some("Choose a .7z, .rar, .zip, .iso, .mds, .exe, or a folder.".to_owned())
-                } else if self.data_root.is_none() || self.profile_store.is_none() {
+                } else if self.data_root.is_none() || self.library_store.is_none() {
                     Some(
                         "The application data directory is unavailable, so a profile cannot be saved."
                             .to_owned(),
@@ -1207,17 +1285,21 @@ impl App {
                 return;
             }
         };
-        let Some(store) = self.profile_store.clone() else {
+        let Some(store) = self.library_store.clone() else {
             wizard.outcome = Some(outcome);
-            wizard.error = Some("The profile database is unavailable.".to_owned());
+            wizard.error = Some("The library database is unavailable.".to_owned());
             return;
         };
-        let title = outcome.title.clone();
+        let Some(target) = self.install_target else {
+            wizard.outcome = Some(outcome);
+            wizard.error = Some("The target library game is unavailable.".to_owned());
+            return;
+        };
         wizard.phase = WizardPhase::Saving;
         wizard.error = None;
 
         thread::spawn(move || {
-            let result = store.save(&title, &profile);
+            let result = store.attach_profile(target.0, &profile);
             sender.input(AppMsg::ProfileSaved { outcome, result });
         });
     }
@@ -1225,17 +1307,17 @@ impl App {
     fn profile_saved(
         &mut self,
         outcome: InstallOutcome,
-        result: Result<StoredProfile, ProfileError>,
+        result: Result<StoredProfile, LibraryError>,
     ) {
         match result {
             Ok(stored) => {
                 outcome.cleanup_after_save();
-                self.games.push(LibraryGame {
-                    id: LibraryGameId::Profile(stored.id),
-                    title: stored.title.clone(),
-                    origin: GameOrigin::Installed(stored),
-                    thumbnail: None,
-                });
+                if let Some(target) = self.install_target
+                    && let Some(game) = self.games.iter_mut().find(|game| game.id == target)
+                {
+                    game.profile = Some(stored);
+                }
+                self.install_target = None;
                 self.wizard = None;
                 self.library_error = None;
                 self.refresh_games_list();
@@ -1263,26 +1345,108 @@ impl App {
         show_executable_chooser(root, sender, &outcome.prefix.join("drive_c"));
     }
 
-    fn add_vndb_title(&mut self, entry: SearchResultWithThumbnail) {
-        let id = LibraryGameId::Temporary(self.next_temporary_game_id);
-        self.next_temporary_game_id += 1;
-        self.games.push(LibraryGame {
-            id,
-            title: entry.summary.title.clone(),
-            origin: GameOrigin::Vndb(entry.summary),
-            thumbnail: entry.thumbnail,
-        });
-        self.library_error = None;
+    fn add_vndb_game(
+        &mut self,
+        entry: SearchResultWithThumbnail,
+        choose_files: bool,
+        root: &adw::ApplicationWindow,
+        sender: ComponentSender<App>,
+    ) {
+        let Some(store) = &self.library_store else {
+            self.library_error = Some("The library database is unavailable.".to_owned());
+            self.show_library();
+            return;
+        };
+        let metadata = metadata_from_vndb(&entry.summary);
+        match store.add_game(&metadata, entry.thumbnail.as_deref()) {
+            Ok(stored) => {
+                let id = LibraryGameId(stored.id);
+                self.games.push(library_game_from_stored(stored));
+                self.library_error = None;
+                self.refresh_games_list();
+                if choose_files {
+                    self.install_target = Some(id);
+                    self.show_library();
+                    self.install_target = Some(id);
+                    show_local_source_prompt(root, sender);
+                } else {
+                    self.show_library();
+                }
+            }
+            Err(error) => {
+                self.library_error = Some(error.to_string());
+                self.show_library();
+            }
+        }
+    }
+
+    fn start_metadata_search(&mut self, id: LibraryGameId) {
+        let Some(game) = self.games.iter().find(|game| game.id == id) else {
+            return;
+        };
+        self.search_target = Some(id);
+        self.query_entry.set_text(&game.metadata.title);
+        self.query = game.metadata.title.clone();
+        self.search = SearchState::Idle;
+        self.replace_search_results(Vec::new());
+        self.library_edit_mode = false;
         self.refresh_games_list();
+        self.page = Page::Search;
+        self.library_error = None;
+    }
+
+    fn replace_metadata_from_vndb(&mut self, id: LibraryGameId, entry: SearchResultWithThumbnail) {
+        let metadata = metadata_from_vndb(&entry.summary);
+        self.update_game_metadata(id, metadata, entry.thumbnail);
+        self.search_target = None;
         self.show_library();
+    }
+
+    fn save_manual_metadata(&mut self, id: LibraryGameId, metadata: GameMetadata) {
+        let thumbnail = self
+            .games
+            .iter()
+            .find(|game| game.id == id)
+            .and_then(|game| game.thumbnail.clone());
+        self.update_game_metadata(id, metadata, thumbnail);
+    }
+
+    fn update_game_metadata(
+        &mut self,
+        id: LibraryGameId,
+        metadata: GameMetadata,
+        thumbnail: Option<Vec<u8>>,
+    ) {
+        let Some(store) = &self.library_store else {
+            self.library_error = Some("The library database is unavailable.".to_owned());
+            return;
+        };
+        match store.update_metadata(id.0, &metadata, thumbnail.as_deref()) {
+            Ok(()) => {
+                if let Some(game) = self.games.iter_mut().find(|game| game.id == id) {
+                    game.metadata = metadata;
+                    game.thumbnail = thumbnail;
+                    if let Some(profile) = &mut game.profile {
+                        profile.title = game.metadata.title.clone();
+                        profile.profile.vndb_id = game.metadata.vndb_id.clone();
+                    }
+                }
+                self.library_error = None;
+                self.refresh_games_list();
+            }
+            Err(error) => {
+                self.library_error = Some(error.to_string());
+            }
+        }
     }
 
     fn start_game(&mut self, id: LibraryGameId, sender: ComponentSender<App>) {
         let Some(game) = self.games.iter().find(|game| game.id == id) else {
             return;
         };
-        let GameOrigin::Installed(stored) = &game.origin else {
-            self.library_error = Some("This VNDB entry has no installed files to run.".to_owned());
+        let Some(stored) = &game.profile else {
+            self.library_error =
+                Some("Choose game files before trying to play this title.".to_owned());
             return;
         };
         let Some(data_root) = self.data_root.clone() else {
@@ -1290,7 +1454,7 @@ impl App {
             return;
         };
         let profile = stored.profile.clone();
-        let title = game.title.clone();
+        let title = game.metadata.title.clone();
         self.library_error = None;
         thread::spawn(move || {
             let result = run_game(&profile, &data_root, &RuntimeCommands::default());
@@ -1298,24 +1462,51 @@ impl App {
         });
     }
 
-    fn remove_game(&mut self, id: LibraryGameId) {
-        let Some(index) = self.games.iter().position(|game| game.id == id) else {
+    fn start_removing_game(
+        &mut self,
+        id: LibraryGameId,
+        delete_files: bool,
+        sender: ComponentSender<App>,
+    ) {
+        let Some(game) = self.games.iter().find(|game| game.id == id) else {
             return;
         };
-        if let GameOrigin::Installed(stored) = &self.games[index].origin {
-            let Some(store) = &self.profile_store else {
-                self.library_error = Some("The profile database is unavailable.".to_owned());
-                return;
-            };
-            if let Err(error) = store.delete(stored.id) {
-                self.library_error = Some(error.to_string());
-                return;
+        let Some(store) = self.library_store.clone() else {
+            self.library_error = Some("The library database is unavailable.".to_owned());
+            return;
+        };
+        let prefix = game
+            .profile
+            .as_ref()
+            .map(|stored| stored.profile.prefix.clone());
+        let data_root = self.data_root.clone();
+        self.library_error = None;
+        thread::spawn(move || {
+            let result = remove_stored_game(
+                &store,
+                id,
+                prefix.as_deref(),
+                data_root.as_deref(),
+                delete_files,
+            );
+            sender.input(AppMsg::GameRemovalFinished { id, result });
+        });
+    }
+
+    fn game_removal_finished(&mut self, id: LibraryGameId, result: Result<Option<String>, String>) {
+        match result {
+            Ok(warning) => {
+                self.games.retain(|game| game.id != id);
+                if self.games.is_empty() {
+                    self.library_edit_mode = false;
+                }
+                self.library_error = warning;
+                self.refresh_games_list();
+            }
+            Err(error) => {
+                self.library_error = Some(error);
             }
         }
-
-        self.games.remove(index);
-        self.library_error = None;
-        self.refresh_games_list();
     }
 
     fn move_game(&mut self, id: LibraryGameId, direction: MoveDirection) {
@@ -1327,15 +1518,8 @@ impl App {
         };
         self.games.swap(index, target);
 
-        if let Some(store) = &self.profile_store {
-            let ids: Vec<i64> = self
-                .games
-                .iter()
-                .filter_map(|game| match &game.origin {
-                    GameOrigin::Installed(stored) => Some(stored.id),
-                    GameOrigin::Vndb(_) => None,
-                })
-                .collect();
+        if let Some(store) = &self.library_store {
+            let ids: Vec<i64> = self.games.iter().map(|game| game.id.0).collect();
             if let Err(error) = store.reorder(&ids) {
                 self.games.swap(index, target);
                 self.library_error = Some(error.to_string());
@@ -1349,6 +1533,9 @@ impl App {
     }
 
     fn show_search(&mut self) {
+        self.search_target = None;
+        self.library_edit_mode = false;
+        self.refresh_games_list();
         self.page = Page::Search;
         self.library_error = None;
     }
@@ -1376,7 +1563,9 @@ impl App {
         }
         if let Some(wizard) = self.wizard.take() {
             wizard.discard();
+            self.install_target = None;
         }
+        self.search_target = None;
         self.page = Page::Library;
         self.query.clear();
         self.query_entry.set_text("");
@@ -1393,6 +1582,7 @@ impl App {
             self.games_grid.append(&build_game_card(
                 game,
                 self.sender.clone(),
+                self.library_edit_mode,
                 index > 0,
                 index + 1 < self.games.len(),
             ));
@@ -1446,6 +1636,79 @@ fn set_path_choices(dropdown: &gtk::DropDown, paths: &[PathBuf]) {
 fn selected_path(paths: &[PathBuf], dropdown: &gtk::DropDown) -> Option<PathBuf> {
     paths.get(dropdown.selected() as usize).cloned()
 }
+fn remove_stored_game(
+    store: &LibraryStore,
+    id: LibraryGameId,
+    prefix: Option<&Path>,
+    data_root: Option<&Path>,
+    delete_files: bool,
+) -> Result<Option<String>, String> {
+    if !delete_files || prefix.is_none() {
+        return store
+            .delete(id.0)
+            .map(|()| None)
+            .map_err(|error| error.to_string());
+    }
+
+    let prefix = prefix.expect("checked above");
+    if !prefix.exists() {
+        return store
+            .delete(id.0)
+            .map(|()| None)
+            .map_err(|error| error.to_string());
+    }
+    let data_root = data_root.ok_or_else(|| {
+        "The application data directory is unavailable; no game files were deleted.".to_owned()
+    })?;
+    let managed_root = data_root
+        .join("prefixes")
+        .canonicalize()
+        .map_err(|error| format!("Cannot validate the managed prefix directory: {error}"))?;
+    let canonical_prefix = prefix.canonicalize().map_err(|error| {
+        format!(
+            "Cannot validate the game prefix {}: {error}",
+            prefix.display()
+        )
+    })?;
+    if canonical_prefix.parent() != Some(managed_root.as_path()) {
+        return Err(format!(
+            "Refusing to delete files outside ryoiki’s managed prefix directory: {}",
+            canonical_prefix.display()
+        ));
+    }
+
+    let staged = managed_root.join(format!(".deleting-{}", id.0));
+    if staged.exists() {
+        return Err(format!(
+            "Cannot stage prefix deletion because {} already exists.",
+            staged.display()
+        ));
+    }
+    fs::rename(&canonical_prefix, &staged).map_err(|error| {
+        format!(
+            "Cannot stage game files at {} for deletion: {error}",
+            canonical_prefix.display()
+        )
+    })?;
+
+    if let Err(error) = store.delete(id.0) {
+        let rollback = fs::rename(&staged, &canonical_prefix);
+        return Err(match rollback {
+            Ok(()) => error.to_string(),
+            Err(rollback_error) => format!(
+                "{error}. Restoring the prefix also failed: {rollback_error}. Files remain at {}.",
+                staged.display()
+            ),
+        });
+    }
+
+    Ok(fs::remove_dir_all(&staged).err().map(|error| {
+        format!(
+            "Removed the library entry, but could not finish deleting {}: {error}",
+            staged.display()
+        )
+    }))
+}
 
 fn moved_index(length: usize, index: usize, direction: MoveDirection) -> Option<usize> {
     match direction {
@@ -1455,26 +1718,43 @@ fn moved_index(length: usize, index: usize, direction: MoveDirection) -> Option<
     }
 }
 
-fn show_remove_game_confirmation(
+fn library_game_from_stored(stored: StoredGame) -> LibraryGame {
+    LibraryGame {
+        id: LibraryGameId(stored.id),
+        metadata: stored.metadata,
+        profile: stored.profile,
+        thumbnail: stored.thumbnail,
+    }
+}
+
+fn metadata_from_vndb(summary: &VnSummary) -> GameMetadata {
+    GameMetadata {
+        title: summary.title.clone(),
+        alttitle: summary.alttitle.clone(),
+        released: summary.released.clone(),
+        vndb_id: Some(summary.id.clone()),
+    }
+}
+
+fn show_vndb_add_choice(
     root: &adw::ApplicationWindow,
     sender: ComponentSender<App>,
-    id: LibraryGameId,
-    title: &str,
+    entry: SearchResultWithThumbnail,
 ) {
     let window = gtk::Window::builder()
         .transient_for(root)
         .modal(true)
-        .title("Remove from library")
+        .title("Add game")
         .resizable(false)
         .build();
     let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
     content.set_margin_all(18);
-    let heading = gtk::Label::new(Some(&format!("Remove “{title}”?")));
+    let heading = gtk::Label::new(Some(&format!("Add “{}”?", entry.summary.title)));
     heading.set_xalign(0.0);
     heading.add_css_class("heading");
     content.append(&heading);
     let description = gtk::Label::new(Some(
-        "This removes the library entry and saved profile. Installed files and the Wine prefix remain on disk.",
+        "Add the VNDB metadata now. Game files can be selected immediately or from the library later.",
     ));
     description.set_xalign(0.0);
     description.set_wrap(true);
@@ -1483,17 +1763,175 @@ fn show_remove_game_confirmation(
     let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     buttons.set_halign(gtk::Align::End);
     let cancel = gtk::Button::with_label("Cancel");
-    let remove = gtk::Button::with_label("Remove");
-    remove.add_css_class("destructive-action");
+    let add_only = gtk::Button::with_label("Add to library");
+    let add_files = gtk::Button::with_label("Choose game files");
+    add_files.add_css_class("suggested-action");
+    let cancel_window = window.clone();
+    cancel.connect_clicked(move |_| cancel_window.close());
+    let only_window = window.clone();
+    let only_sender = sender.clone();
+    let only_entry = entry.clone();
+    add_only.connect_clicked(move |_| {
+        only_window.close();
+        only_sender.input(AppMsg::AddVndbOnly(only_entry.clone()));
+    });
+    let files_window = window.clone();
+    add_files.connect_clicked(move |_| {
+        files_window.close();
+        sender.input(AppMsg::AddVndbAndFiles(entry.clone()));
+    });
+    buttons.append(&cancel);
+    buttons.append(&add_only);
+    buttons.append(&add_files);
+    content.append(&buttons);
+    window.set_child(Some(&content));
+    window.present();
+}
+
+fn show_metadata_editor(
+    root: &adw::ApplicationWindow,
+    sender: ComponentSender<App>,
+    game: &LibraryGame,
+) {
+    let window = gtk::Window::builder()
+        .transient_for(root)
+        .modal(true)
+        .title("Edit game metadata")
+        .resizable(false)
+        .default_width(460)
+        .build();
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    content.set_margin_all(18);
+
+    let title = gtk::Entry::new();
+    title.set_text(&game.metadata.title);
+    title.set_placeholder_text(Some("Display title"));
+    content.append(&gtk::Label::builder().label("Title").xalign(0.0).build());
+    content.append(&title);
+
+    let original_title = gtk::Entry::new();
+    original_title.set_text(game.metadata.alttitle.as_deref().unwrap_or_default());
+    original_title.set_placeholder_text(Some("Optional original title"));
+    content.append(
+        &gtk::Label::builder()
+            .label("Original title")
+            .xalign(0.0)
+            .build(),
+    );
+    content.append(&original_title);
+
+    let released = gtk::Entry::new();
+    released.set_text(game.metadata.released.as_deref().unwrap_or_default());
+    released.set_placeholder_text(Some("Optional release date"));
+    content.append(
+        &gtk::Label::builder()
+            .label("Release date")
+            .xalign(0.0)
+            .build(),
+    );
+    content.append(&released);
+
+    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    buttons.set_halign(gtk::Align::End);
+    let cancel = gtk::Button::with_label("Cancel");
+    let search = gtk::Button::with_label("Search VNDB");
+    let save = gtk::Button::with_label("Save");
+    save.add_css_class("suggested-action");
+    save.set_sensitive(!title.text().trim().is_empty());
+    let save_for_title = save.clone();
+    title.connect_changed(move |entry| {
+        save_for_title.set_sensitive(!entry.text().trim().is_empty())
+    });
+
+    let cancel_window = window.clone();
+    cancel.connect_clicked(move |_| cancel_window.close());
+    let search_window = window.clone();
+    let search_sender = sender.clone();
+    let id = game.id;
+    search.connect_clicked(move |_| {
+        search_window.close();
+        search_sender.input(AppMsg::SearchMetadata(id));
+    });
+    let save_window = window.clone();
+    let vndb_id = game.metadata.vndb_id.clone();
+    save.connect_clicked(move |_| {
+        save_window.close();
+        sender.input(AppMsg::SaveManualMetadata {
+            id,
+            metadata: GameMetadata {
+                title: title.text().trim().to_owned(),
+                alttitle: nonempty_entry(&original_title),
+                released: nonempty_entry(&released),
+                vndb_id: vndb_id.clone(),
+            },
+        });
+    });
+
+    buttons.append(&cancel);
+    buttons.append(&search);
+    buttons.append(&save);
+    content.append(&buttons);
+    window.set_child(Some(&content));
+    window.present();
+}
+
+fn nonempty_entry(entry: &gtk::Entry) -> Option<String> {
+    let value = entry.text().trim().to_owned();
+    (!value.is_empty()).then_some(value)
+}
+
+fn show_remove_game_confirmation(
+    root: &adw::ApplicationWindow,
+    sender: ComponentSender<App>,
+    id: LibraryGameId,
+    title: &str,
+    has_game_files: bool,
+) {
+    let window = gtk::Window::builder()
+        .transient_for(root)
+        .modal(true)
+        .title("Remove game")
+        .resizable(false)
+        .build();
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    content.set_margin_all(18);
+    let heading = gtk::Label::new(Some(&format!("Remove “{title}”?")));
+    heading.set_xalign(0.0);
+    heading.add_css_class("heading");
+    content.append(&heading);
+    let description = gtk::Label::new(Some(if has_game_files {
+        "Remove only the library entry, or also permanently delete its ryoiki-managed Wine prefix. Original archives, disc images, and external files are never deleted."
+    } else {
+        "This removes the metadata-only library entry."
+    }));
+    description.set_xalign(0.0);
+    description.set_wrap(true);
+    content.append(&description);
+
+    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    buttons.set_halign(gtk::Align::End);
+    let cancel = gtk::Button::with_label("Cancel");
+    let remove = gtk::Button::with_label("Remove from library");
     let cancel_window = window.clone();
     cancel.connect_clicked(move |_| cancel_window.close());
     let remove_window = window.clone();
+    let remove_sender = sender.clone();
     remove.connect_clicked(move |_| {
         remove_window.close();
-        sender.input(AppMsg::ConfirmRemoveGame(id));
+        remove_sender.input(AppMsg::ConfirmRemoveGame(id));
     });
     buttons.append(&cancel);
     buttons.append(&remove);
+    if has_game_files {
+        let delete = gtk::Button::with_label("Delete files and remove");
+        delete.add_css_class("destructive-action");
+        let delete_window = window.clone();
+        delete.connect_clicked(move |_| {
+            delete_window.close();
+            sender.input(AppMsg::ConfirmDeleteGameFiles(id));
+        });
+        buttons.append(&delete);
+    }
     content.append(&buttons);
     window.set_child(Some(&content));
     window.present();
@@ -1650,6 +2088,7 @@ async fn search_with_thumbnails(
 fn build_game_card(
     game: &LibraryGame,
     sender: ComponentSender<App>,
+    edit_mode: bool,
     can_move_previous: bool,
     can_move_next: bool,
 ) -> gtk::Box {
@@ -1661,13 +2100,13 @@ fn build_game_card(
 
     card.append(&cover_widget(
         game.thumbnail.clone(),
-        &format!("Cover for {}", game.title),
+        &format!("Cover for {}", game.metadata.title),
         CARD_COVER_WIDTH,
         CARD_COVER_HEIGHT,
         "library-cover",
     ));
 
-    let title = gtk::Label::new(Some(&game.title));
+    let title = gtk::Label::new(Some(&game.metadata.title));
     title.set_wrap(true);
     title.set_wrap_mode(gtk::pango::WrapMode::WordChar);
     title.set_justify(gtk::Justification::Center);
@@ -1678,24 +2117,20 @@ fn build_game_card(
     title.add_css_class("heading");
     card.append(&title);
 
-    let subtitle = gtk::Label::new(Some(&game_subtitle(game)));
-    subtitle.set_wrap(true);
-    subtitle.set_justify(gtk::Justification::Center);
-    subtitle.set_xalign(0.5);
-    subtitle.set_max_width_chars(18);
-    subtitle.set_lines(2);
-    subtitle.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    subtitle.add_css_class("dim-label");
-    subtitle.add_css_class("caption");
-    card.append(&subtitle);
-
-    if matches!(&game.origin, GameOrigin::Installed(_)) {
-        let play = gtk::Button::with_label("Play");
-        play.add_css_class("suggested-action");
-        let play_sender = sender.clone();
-        let id = game.id;
-        play.connect_clicked(move |_| play_sender.input(AppMsg::LaunchGame(id)));
-        card.append(&play);
+    if !edit_mode {
+        if game.profile.is_some() {
+            let play = gtk::Button::with_label("Play");
+            play.add_css_class("suggested-action");
+            let id = game.id;
+            play.connect_clicked(move |_| sender.input(AppMsg::LaunchGame(id)));
+            card.append(&play);
+        } else {
+            let files = gtk::Button::with_label("Choose game files");
+            let id = game.id;
+            files.connect_clicked(move |_| sender.input(AppMsg::ChooseGameFiles(id)));
+            card.append(&files);
+        }
+        return card;
     }
 
     let controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -1727,8 +2162,15 @@ fn build_game_card(
     });
     controls.append(&next);
 
+    let edit = gtk::Button::from_icon_name("document-edit-symbolic");
+    edit.set_tooltip_text(Some("Edit metadata"));
+    let edit_sender = sender.clone();
+    let id = game.id;
+    edit.connect_clicked(move |_| edit_sender.input(AppMsg::EditMetadata(id)));
+    controls.append(&edit);
+
     let remove = gtk::Button::from_icon_name("user-trash-symbolic");
-    remove.set_tooltip_text(Some("Remove from library"));
+    remove.set_tooltip_text(Some("Remove or delete game files"));
     remove.add_css_class("destructive-action");
     let id = game.id;
     remove.connect_clicked(move |_| sender.input(AppMsg::RequestRemoveGame(id)));
@@ -1736,26 +2178,6 @@ fn build_game_card(
     card.append(&controls);
 
     card
-}
-
-fn game_subtitle(game: &LibraryGame) -> String {
-    match &game.origin {
-        GameOrigin::Installed(stored) => format!(
-            "{} {}\n{}",
-            stored.profile.runner.as_str(),
-            stored.profile.arch.as_str(),
-            stored.profile.exe.display()
-        ),
-        GameOrigin::Vndb(summary) => {
-            let mut subtitle = summary.id.clone();
-            if let Some(released) = &summary.released {
-                subtitle.push_str(" · ");
-                subtitle.push_str(released);
-            }
-            subtitle.push_str("\nNo local files");
-            subtitle
-        }
-    }
 }
 
 fn build_result_row(
@@ -1866,88 +2288,18 @@ fn result_subtitle(entry: &VnSummary) -> String {
     subtitle
 }
 
-fn guess_search_query(path: &Path) -> String {
-    let raw = path
-        .file_stem()
-        .or_else(|| path.file_name())
-        .and_then(|name| name.to_str())
-        .unwrap_or_default();
-    clean_title_guess(raw)
-}
-
-fn fallback_title(source: &IdentifiedSource) -> String {
-    let guess = guess_search_query(&source.path);
-    if guess.is_empty() {
-        source
-            .path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("Untitled")
-            .to_owned()
-    } else {
-        guess
-    }
-}
-
-fn clean_title_guess(raw: &str) -> String {
-    let stripped = strip_grouped_tags(raw);
-    let mut text = stripped.replace('_', " ");
-    if !text.contains(' ') && text.chars().filter(|character| *character == '.').count() >= 1 {
-        text = text.replace('.', " ");
-    }
-    collapse_whitespace(&text)
-        .trim_matches(|character: char| character.is_ascii_punctuation())
-        .to_owned()
-}
-
-fn strip_grouped_tags(raw: &str) -> String {
-    let mut out = String::new();
-    let mut square = 0_u32;
-    let mut paren = 0_u32;
-    for character in raw.chars() {
-        match character {
-            '[' => square = square.saturating_add(1),
-            ']' => square = square.saturating_sub(1),
-            '(' => paren = paren.saturating_add(1),
-            ')' => paren = paren.saturating_sub(1),
-            _ if square == 0 && paren == 0 => out.push(character),
-            _ => {}
-        }
-    }
-    out
-}
-
-fn collapse_whitespace(raw: &str) -> String {
-    let mut out = String::new();
-    let mut previous_space = false;
-    for character in raw.chars() {
-        if character.is_whitespace() {
-            if !previous_space && !out.is_empty() {
-                out.push(' ');
-            }
-            previous_space = true;
-        } else {
-            out.push(character);
-            previous_space = false;
-        }
-    }
-    out.trim().to_owned()
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
     use crate::{
-        profile::{LaunchProfile, PrefixArch, Runner, StoredProfile},
-        stages::identify::{IdentifiedSource, SourceKind},
+        profile::{GameMetadata, LaunchProfile, PrefixArch, Runner, StoredProfile},
         vndb::VnSummary,
     };
     use relm4::gtk::{self, prelude::*};
+    use tempfile::tempdir;
 
-    use super::{
-        GameOrigin, LibraryGame, LibraryGameId, MoveDirection, moved_index, result_subtitle,
-    };
+    use super::{LibraryGameId, MoveDirection, moved_index, remove_stored_game, result_subtitle};
 
     #[test]
     fn formats_original_title_and_release_for_result_rows() {
@@ -1996,64 +2348,90 @@ mod tests {
     }
 
     #[test]
-    fn install_source_uses_cleaned_file_name_without_vndb() {
-        let source = IdentifiedSource {
-            path: PathBuf::from("[Group] Subarashiki_Hibi [ENG].7z"),
-            kind: SourceKind::Archive(crate::stages::identify::ArchiveFormat::SevenZip),
+    fn removal_can_preserve_or_delete_only_managed_prefixes() {
+        let root = tempdir().expect("temporary directory");
+        let store = crate::profile::LibraryStore::new(root.path());
+        let prefixes = root.path().join("prefixes");
+        let prefix = prefixes.join("game");
+        std::fs::create_dir_all(prefix.join("drive_c")).expect("managed prefix");
+        let metadata = GameMetadata {
+            title: "Game".to_owned(),
+            alttitle: None,
+            released: None,
+            vndb_id: Some("v1".to_owned()),
         };
-
-        assert_eq!(super::fallback_title(&source), "Subarashiki Hibi");
-    }
-
-    #[test]
-    fn installed_game_card_uses_the_saved_launch_profile() {
         let profile = LaunchProfile {
-            exe: PathBuf::from("/games/prefix/drive_c/Game/game.exe"),
-            prefix: PathBuf::from("/games/prefix"),
-            arch: PrefixArch::Win32,
+            exe: prefix.join("drive_c/game.exe"),
+            prefix: prefix.clone(),
+            arch: PrefixArch::Win64,
             runner: Runner::Wine,
             locale: "ja_JP.UTF-8".to_owned(),
             disc: None,
             winetricks: Vec::new(),
-            vndb_id: None,
+            vndb_id: Some("v1".to_owned()),
             notes: String::new(),
         };
-        let game = LibraryGame {
-            id: LibraryGameId::Profile(7),
-            title: "Subarashiki Hibi".to_owned(),
-            origin: GameOrigin::Installed(StoredProfile {
-                id: 7,
-                title: "Subarashiki Hibi".to_owned(),
-                profile,
-            }),
-            thumbnail: None,
-        };
 
-        assert_eq!(
-            super::game_subtitle(&game),
-            "wine win32\n/games/prefix/drive_c/Game/game.exe"
-        );
+        let first = store.add_game(&metadata, None).expect("add first game");
+        store
+            .attach_profile(first.id, &profile)
+            .expect("attach first profile");
+        remove_stored_game(
+            &store,
+            LibraryGameId(first.id),
+            Some(&prefix),
+            Some(root.path()),
+            false,
+        )
+        .expect("remove library entry only");
+        assert!(prefix.is_dir());
+        assert!(store.load().expect("load empty library").is_empty());
+
+        let second = store.add_game(&metadata, None).expect("add second game");
+        store
+            .attach_profile(second.id, &profile)
+            .expect("attach second profile");
+        remove_stored_game(
+            &store,
+            LibraryGameId(second.id),
+            Some(&prefix),
+            Some(root.path()),
+            true,
+        )
+        .expect("delete managed prefix");
+        assert!(!prefix.exists());
+        assert!(store.load().expect("load empty library").is_empty());
     }
 
     #[test]
-    fn vndb_add_records_metadata_without_local_files() {
-        let game = LibraryGame {
-            id: LibraryGameId::Temporary(1),
-            title: "Primary".to_owned(),
-            origin: GameOrigin::Vndb(VnSummary {
-                id: "v1".to_owned(),
-                title: "Primary".to_owned(),
-                alttitle: None,
-                released: Some("2010-03-26".to_owned()),
-                image: None,
-            }),
-            thumbnail: None,
-        };
+    fn destructive_removal_rejects_external_prefixes() {
+        let root = tempdir().expect("temporary directory");
+        let external = tempdir().expect("external prefix");
+        std::fs::create_dir(root.path().join("prefixes")).expect("managed prefix root");
+        let store = crate::profile::LibraryStore::new(root.path());
+        let game = store
+            .add_game(
+                &GameMetadata {
+                    title: "External".to_owned(),
+                    alttitle: None,
+                    released: None,
+                    vndb_id: None,
+                },
+                None,
+            )
+            .expect("add game");
 
-        assert_eq!(
-            super::game_subtitle(&game),
-            "v1 · 2010-03-26\nNo local files"
-        );
+        let error = remove_stored_game(
+            &store,
+            LibraryGameId(game.id),
+            Some(external.path()),
+            Some(root.path()),
+            true,
+        )
+        .expect_err("external prefix must be preserved");
+        assert!(error.contains("Refusing to delete files outside"));
+        assert_eq!(store.load().expect("game remains").len(), 1);
+        assert!(external.path().exists());
     }
 
     #[test]
@@ -2062,25 +2440,5 @@ mod tests {
         assert_eq!(moved_index(3, 1, MoveDirection::Next), Some(2));
         assert_eq!(moved_index(3, 0, MoveDirection::Previous), None);
         assert_eq!(moved_index(3, 2, MoveDirection::Next), None);
-    }
-
-    #[test]
-    fn guess_search_query_strips_release_tags() {
-        assert_eq!(
-            super::guess_search_query(PathBuf::from("[Group] Subarashiki_Hibi [ENG].7z").as_path()),
-            "Subarashiki Hibi"
-        );
-        assert_eq!(
-            super::guess_search_query(PathBuf::from("Wonderful.Everyday.iso").as_path()),
-            "Wonderful Everyday"
-        );
-        assert_eq!(
-            super::guess_search_query(PathBuf::from("[ENG].zip").as_path()),
-            ""
-        );
-        assert_eq!(
-            super::guess_search_query(PathBuf::from("素晴らしき日々.7z").as_path()),
-            "素晴らしき日々"
-        );
     }
 }

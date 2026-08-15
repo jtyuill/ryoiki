@@ -63,7 +63,6 @@ pub struct PreparedInstall {
 
 #[derive(Clone, Debug)]
 pub struct InstallOutcome {
-    pub title: String,
     pub session_dir: PathBuf,
     pub prefix: PathBuf,
     pub arch: PrefixArch,
@@ -212,12 +211,11 @@ pub fn execute_install(
         prepared.request.arch,
         &locale,
         &prepared.request.commands.wineboot,
+        &prepared.request.commands.wine,
     )?;
-
     let result = execute_with_prefix(&prepared, &installer, &prefix, &locale);
     match result {
         Ok(executables) => Ok(InstallOutcome {
-            title: prepared.request.title,
             session_dir: prepared.source.session_dir,
             prefix,
             arch: prepared.request.arch,
@@ -384,7 +382,6 @@ mod tests {
         let outside = root.path().join("outside.exe");
         File::create(&outside).expect("outside executable");
         let outcome = InstallOutcome {
-            title: "Game".to_owned(),
             session_dir: root.path().join("session"),
             prefix,
             arch: PrefixArch::Win32,

@@ -37,6 +37,12 @@ pub enum PrefixError {
         #[source]
         source: io::Error,
     },
+    #[error("cannot record Japanese font configuration at {path}: {source}")]
+    RecordFontConfiguration {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
     #[error("cannot create private locale directory {path}: {source}")]
     CreateLocaleDirectory {
         path: PathBuf,
@@ -72,6 +78,8 @@ pub enum PrefixError {
     UnsupportedArchitecture,
     #[error("wineboot failed for {path}: {message}")]
     Failed { path: PathBuf, message: String },
+    #[error("cannot configure Japanese UI fonts for prefix {path}: {message}")]
+    FontConfiguration { path: PathBuf, message: String },
 }
 
 pub fn prepare_locale(
@@ -141,6 +149,7 @@ pub fn create_prefix(
     arch: PrefixArch,
     locale: &LocaleEnvironment,
     wineboot: &Path,
+    wine: &Path,
 ) -> Result<(), PrefixError> {
     if path.exists() {
         return Err(PrefixError::AlreadyExists {
@@ -164,7 +173,9 @@ pub fn create_prefix(
         source,
     })?;
     if output.status.success() {
-        if let Err(error) = isolate_user_folders(path) {
+        if let Err(error) =
+            isolate_user_folders(path).and_then(|()| ensure_japanese_ui_font(path, locale, wine))
+        {
             let _ = fs::remove_dir_all(path);
             return Err(error);
         }
@@ -189,6 +200,66 @@ pub fn create_prefix(
             },
         })
     }
+}
+
+pub fn ensure_japanese_ui_font(
+    prefix: &Path,
+    locale: &LocaleEnvironment,
+    wine: &Path,
+) -> Result<(), PrefixError> {
+    const MARKER: &str = ".ryoiki-japanese-ui-font";
+    const FONT: &str = "Noto Sans CJK JP";
+    const SUBSTITUTES: [&str; 5] = [
+        "MS Shell Dlg",
+        "MS Shell Dlg 2",
+        "MS UI Gothic",
+        "Meiryo UI",
+        "Yu Gothic UI",
+    ];
+
+    let marker = prefix.join(MARKER);
+    if marker.is_file() {
+        return Ok(());
+    }
+
+    for name in SUBSTITUTES {
+        let mut command = Command::new(wine);
+        command
+            .args([
+                "reg",
+                "add",
+                r"HKLM\Software\Microsoft\Windows NT\CurrentVersion\FontSubstitutes",
+                "/v",
+                name,
+                "/t",
+                "REG_SZ",
+                "/d",
+                FONT,
+                "/f",
+            ])
+            .env("WINEPREFIX", prefix);
+        locale.apply(&mut command);
+        let output = command.output().map_err(|source| PrefixError::Start {
+            program: wine.to_path_buf(),
+            source,
+        })?;
+        if !output.status.success() {
+            let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            return Err(PrefixError::FontConfiguration {
+                path: prefix.to_path_buf(),
+                message: if message.is_empty() {
+                    output.status.to_string()
+                } else {
+                    message
+                },
+            });
+        }
+    }
+
+    fs::write(&marker, FONT).map_err(|source| PrefixError::RecordFontConfiguration {
+        path: marker,
+        source,
+    })
 }
 
 fn isolate_user_folders(prefix: &Path) -> Result<(), PrefixError> {
@@ -321,6 +392,7 @@ mod tests {
             PrefixArch::Win32,
             &locale,
             &wineboot,
+            &wineboot,
         )
         .expect_err("win32 prefix should fail");
 
@@ -332,6 +404,11 @@ mod tests {
     fn prefix_replaces_host_shell_folder_links_with_private_directories() {
         let root = tempdir().expect("temporary directory");
         let wineboot = root.path().join("wineboot");
+        let wine = root.path().join("wine");
+        write_executable(
+            &wine,
+            "#!/bin/sh\nprintf '%s=%s\\n' \"$5\" \"$9\" >> \"$WINEPREFIX/font-substitutes\"\n",
+        );
         write_executable(
             &wineboot,
             "#!/bin/sh\nuser=\"$WINEPREFIX/drive_c/users/test\"\nmkdir -p \"$user/AppData\"\nln -s /tmp/host-documents \"$user/Documents\"\nln -s /tmp/host-desktop \"$user/Desktop\"\n",
@@ -342,7 +419,7 @@ mod tests {
         };
         let prefix = root.path().join("prefix");
 
-        super::create_prefix(&prefix, PrefixArch::Win64, &locale, &wineboot)
+        super::create_prefix(&prefix, PrefixArch::Win64, &locale, &wineboot, &wine)
             .expect("create isolated prefix");
 
         for folder in ["Documents", "Desktop"] {
@@ -356,6 +433,11 @@ mod tests {
             );
         }
         assert!(prefix.join("drive_c/users/test/AppData").is_dir());
+        let substitutions =
+            fs::read_to_string(prefix.join("font-substitutes")).expect("font substitutions");
+        assert!(substitutions.contains("MS Shell Dlg=Noto Sans CJK JP"));
+        assert!(substitutions.contains("MS Shell Dlg 2=Noto Sans CJK JP"));
+        assert!(prefix.join(".ryoiki-japanese-ui-font").is_file());
     }
 
     #[test]

@@ -12,7 +12,7 @@ use crate::profile::{LaunchProfile, Runner};
 
 use super::{
     install::RuntimeCommands,
-    prefix::{PrefixError, prepare_locale},
+    prefix::{PrefixError, ensure_japanese_ui_font, prepare_locale},
 };
 
 #[derive(Debug, Error)]
@@ -84,6 +84,7 @@ fn launch_wine(
         &commands.locale,
         &commands.localedef,
     )?;
+    ensure_japanese_ui_font(&profile.prefix, &locale, &commands.wine)?;
     let mut command = Command::new(&commands.wine);
     command
         .arg(executable)
@@ -161,7 +162,7 @@ mod tests {
         let locale = tools.join("locale");
         write_executable(
             &wine,
-            "#!/bin/sh\nprintf '%s\\n%s\\n%s' \"$1\" \"$WINEPREFIX\" \"$LC_ALL\" > \"$WINEPREFIX/launch\"\n",
+            "#!/bin/sh\nif [ \"$1\" = reg ]; then exit 0; fi\nprintf '%s\\n%s\\n%s' \"$1\" \"$WINEPREFIX\" \"$LC_ALL\" > \"$WINEPREFIX/launch\"\n",
         );
         write_executable(&locale, "#!/bin/sh\nprintf 'ja_JP.utf8\\n'\n");
         let profile = LaunchProfile {
@@ -189,6 +190,7 @@ mod tests {
             fs::read_to_string(prefix.join("launch")).expect("launch record"),
             format!("C:\\Game\\game.exe\n{}\nja_JP.UTF-8", prefix.display())
         );
+        assert!(prefix.join(".ryoiki-japanese-ui-font").is_file());
     }
 
     fn write_executable(path: &Path, contents: &str) {

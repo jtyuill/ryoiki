@@ -2,9 +2,10 @@
 
 Native Linux visual novel setup manager. The current source build provides:
 
-- A GTK 4/libadwaita library home. + starts a local install or adds a VNDB title.
+- A GTK 4/libadwaita library home. Adding a game starts with VNDB metadata; users can add it without files or continue into installation.
+- Library entries persist independently from launch profiles. Metadata can be replaced from VNDB or edited manually, and files can be selected later.
 - The install wizard accepts archives, disc images, folders, and Windows installers. It extracts with `7z`, creates an isolated per-game Wine prefix, keeps Windows user folders inside that prefix, maps extracted disc files as `d:`, and runs the installer interactively.
-- After setup, the wizard discovers new executables, asks which one to launch, and saves the launch profile in SQLite. Saved profiles load back into the library and can be launched, reordered, or removed without deleting installed files.
+- After setup, the wizard discovers new executables, asks which one to launch, and attaches the saved launch profile to the existing library entry. Normal cards focus on cover, title, and launch; edit mode exposes metadata, ordering, library-only removal, and explicit deletion of ryoiki-managed Wine prefixes.
 - Multiple discs and setup programs require an explicit choice. Physical-disc checks and copy-protection workarounds are not implemented.
 
 ## Build from source
@@ -18,6 +19,7 @@ Requirements:
 - `7z`
 - `wine` and `wineboot`
 - `locale` and `localedef` (used to generate a private `ja_JP.UTF-8` locale when needed)
+- `Noto Sans CJK JP` (used for Japanese Wine UI and titlebar glyphs)
 
 Build and run:
 
