@@ -48,6 +48,7 @@ pub struct App {
     wizard_disc_dropdown: gtk::DropDown,
     wizard_installer_dropdown: gtk::DropDown,
     wizard_executable_dropdown: gtk::DropDown,
+    file_chooser: Option<gtk::FileChooserNative>,
     search_target: Option<LibraryGameId>,
     install_target: Option<LibraryGameId>,
 }
@@ -653,6 +654,7 @@ impl Component for App {
             wizard_disc_dropdown,
             wizard_installer_dropdown,
             wizard_executable_dropdown,
+            file_chooser: None,
             search_target: None,
             install_target: None,
         };
@@ -665,14 +667,14 @@ impl Component for App {
     fn update(&mut self, message: Self::Input, sender: ComponentSender<Self>, root: &Self::Root) {
         match message {
             AppMsg::ChooseSourceFile => {
-                show_source_chooser(root, sender, gtk::FileChooserAction::Open);
+                self.show_source_chooser(root, sender, gtk::FileChooserAction::Open);
             }
             AppMsg::ChooseGameFiles(id) => {
                 self.install_target = Some(id);
                 show_local_source_prompt(root, sender);
             }
             AppMsg::ChooseSourceFolder => {
-                show_source_chooser(root, sender, gtk::FileChooserAction::SelectFolder);
+                self.show_source_chooser(root, sender, gtk::FileChooserAction::SelectFolder);
             }
             AppMsg::SourceSelected(path) => {
                 self.open_install_wizard(path);
@@ -1274,7 +1276,8 @@ impl App {
         let executable = wizard
             .selected_executable
             .clone()
-            .or_else(|| selected_path(&outcome.executables, &self.wizard_executable_dropdown));
+            .or_else(|| selected_path(&outcome.executables, &self.wizard_executable_dropdown))
+            .or_else(|| outcome.executables.first().cloned());
         let Some(executable) = executable else {
             wizard.outcome = Some(outcome);
             wizard.error = Some("Choose the installed game executable.".to_owned());
@@ -1336,7 +1339,7 @@ impl App {
         }
     }
 
-    fn show_executable_chooser(&self, root: &adw::ApplicationWindow, sender: ComponentSender<App>) {
+    fn show_executable_chooser(&mut self, root: &adw::ApplicationWindow, sender: ComponentSender<App>) {
         let Some(outcome) = self
             .wizard
             .as_ref()
@@ -1345,7 +1348,87 @@ impl App {
         else {
             return;
         };
-        show_executable_chooser(root, sender, &outcome.prefix.join("drive_c"));
+        let drive_c = outcome.prefix.join("drive_c");
+        self.present_file_chooser(
+            root,
+            sender,
+            gtk::FileChooserAction::Open,
+            Some("Choose installed game executable"),
+            Some(&drive_c),
+            true,
+        );
+    }
+
+    fn show_source_chooser(
+        &mut self,
+        root: &adw::ApplicationWindow,
+        sender: ComponentSender<App>,
+        action: gtk::FileChooserAction,
+    ) {
+        let title = match action {
+            gtk::FileChooserAction::SelectFolder => "Choose a folder",
+            _ => "Choose install files",
+        };
+        self.present_file_chooser(root, sender, action, Some(title), None, false);
+    }
+
+    fn present_file_chooser(
+        &mut self,
+        root: &adw::ApplicationWindow,
+        sender: ComponentSender<App>,
+        action: gtk::FileChooserAction,
+        title: Option<&str>,
+        current_folder: Option<&Path>,
+        executables_only: bool,
+    ) {
+        let chooser = gtk::FileChooserNative::new(
+            title,
+            Some(root),
+            action,
+            Some("Choose"),
+            Some("Cancel"),
+        );
+        if executables_only {
+            let executables = gtk::FileFilter::new();
+            executables.set_name(Some("Windows executables"));
+            executables.add_pattern("*.exe");
+            executables.add_pattern("*.EXE");
+            chooser.add_filter(&executables);
+        } else if action == gtk::FileChooserAction::Open {
+            let supported = gtk::FileFilter::new();
+            supported.set_name(Some("Install sources"));
+            for pattern in [
+                "*.7z", "*.rar", "*.zip", "*.iso", "*.mds", "*.exe", "*.7Z", "*.RAR", "*.ZIP",
+                "*.ISO", "*.MDS", "*.EXE",
+            ] {
+                supported.add_pattern(pattern);
+            }
+            chooser.add_filter(&supported);
+            let all_files = gtk::FileFilter::new();
+            all_files.set_name(Some("All files"));
+            all_files.add_pattern("*");
+            chooser.add_filter(&all_files);
+        }
+        if let Some(folder) = current_folder {
+            let folder = gtk::gio::File::for_path(folder);
+            let _ = chooser.set_current_folder(Some(&folder));
+        }
+        chooser.connect_response(move |chooser, response| {
+            if response == gtk::ResponseType::Accept
+                && let Some(path) = chooser.file().and_then(|file| file.path())
+            {
+                if executables_only {
+                    sender.input(AppMsg::WizardExecutableSelected(path));
+                } else {
+                    sender.input(AppMsg::SourceSelected(path));
+                }
+            }
+            chooser.destroy();
+        });
+        chooser.show();
+        if let Some(previous) = self.file_chooser.replace(chooser) {
+            previous.destroy();
+        }
     }
 
     fn add_vndb_game(
@@ -1944,35 +2027,6 @@ fn show_remove_game_confirmation(
     window.present();
 }
 
-fn show_executable_chooser(
-    root: &adw::ApplicationWindow,
-    sender: ComponentSender<App>,
-    drive_c: &Path,
-) {
-    let chooser = gtk::FileChooserNative::new(
-        Some("Choose installed game executable"),
-        Some(root),
-        gtk::FileChooserAction::Open,
-        Some("Choose"),
-        Some("Cancel"),
-    );
-    let executables = gtk::FileFilter::new();
-    executables.set_name(Some("Windows executables"));
-    executables.add_pattern("*.exe");
-    executables.add_pattern("*.EXE");
-    chooser.add_filter(&executables);
-    let folder = gtk::gio::File::for_path(drive_c);
-    let _ = chooser.set_current_folder(Some(&folder));
-    chooser.connect_response(move |chooser, response| {
-        if response == gtk::ResponseType::Accept
-            && let Some(path) = chooser.file().and_then(|file| file.path())
-        {
-            sender.input(AppMsg::WizardExecutableSelected(path));
-        }
-        chooser.destroy();
-    });
-    chooser.show();
-}
 
 fn show_local_source_prompt(root: &adw::ApplicationWindow, sender: ComponentSender<App>) {
     let window = gtk::Window::builder()
@@ -2025,50 +2079,6 @@ fn show_local_source_prompt(root: &adw::ApplicationWindow, sender: ComponentSend
     window.present();
 }
 
-fn show_source_chooser(
-    root: &adw::ApplicationWindow,
-    sender: ComponentSender<App>,
-    action: gtk::FileChooserAction,
-) {
-    let title = match action {
-        gtk::FileChooserAction::SelectFolder => "Choose a folder",
-        _ => "Choose install files",
-    };
-    let chooser = gtk::FileChooserNative::new(
-        Some(title),
-        Some(root),
-        action,
-        Some("Choose"),
-        Some("Cancel"),
-    );
-
-    if action == gtk::FileChooserAction::Open {
-        let supported = gtk::FileFilter::new();
-        supported.set_name(Some("Install sources"));
-        for pattern in [
-            "*.7z", "*.rar", "*.zip", "*.iso", "*.mds", "*.exe", "*.7Z", "*.RAR", "*.ZIP", "*.ISO",
-            "*.MDS", "*.EXE",
-        ] {
-            supported.add_pattern(pattern);
-        }
-        chooser.add_filter(&supported);
-
-        let all_files = gtk::FileFilter::new();
-        all_files.set_name(Some("All files"));
-        all_files.add_pattern("*");
-        chooser.add_filter(&all_files);
-    }
-
-    chooser.connect_response(move |chooser, response| {
-        if response == gtk::ResponseType::Accept
-            && let Some(path) = chooser.file().and_then(|file| file.path())
-        {
-            sender.input(AppMsg::SourceSelected(path));
-        }
-        chooser.destroy();
-    });
-    chooser.show();
-}
 
 async fn search_with_thumbnails(
     client: VndbClient,

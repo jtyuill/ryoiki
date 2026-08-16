@@ -263,16 +263,6 @@ pub fn ensure_japanese_ui_font(
 }
 
 fn isolate_user_folders(prefix: &Path) -> Result<(), PrefixError> {
-    const HOST_FOLDER_LINKS: [&str; 7] = [
-        "Desktop",
-        "Documents",
-        "Downloads",
-        "Music",
-        "My Documents",
-        "Pictures",
-        "Videos",
-    ];
-
     let users = prefix.join("drive_c/users");
     let entries = fs::read_dir(&users).map_err(|source| PrefixError::IsolateUserFolder {
         path: users.clone(),
@@ -293,26 +283,31 @@ fn isolate_user_folders(prefix: &Path) -> Result<(), PrefixError> {
             continue;
         }
 
-        for folder_name in HOST_FOLDER_LINKS {
-            let folder = entry.path().join(folder_name);
-            match fs::symlink_metadata(&folder) {
+        let folders = fs::read_dir(entry.path()).map_err(|source| PrefixError::IsolateUserFolder {
+            path: entry.path(),
+            source,
+        })?;
+        for folder in folders {
+            let folder = folder.map_err(|source| PrefixError::IsolateUserFolder {
+                path: entry.path(),
+                source,
+            })?;
+            let path = folder.path();
+            match fs::symlink_metadata(&path) {
                 Ok(metadata) if metadata.file_type().is_symlink() => {
-                    fs::remove_file(&folder).map_err(|source| PrefixError::IsolateUserFolder {
-                        path: folder.clone(),
+                    fs::remove_file(&path).map_err(|source| PrefixError::IsolateUserFolder {
+                        path: path.clone(),
                         source,
                     })?;
-                    fs::create_dir(&folder).map_err(|source| PrefixError::IsolateUserFolder {
-                        path: folder.clone(),
+                    fs::create_dir(&path).map_err(|source| PrefixError::IsolateUserFolder {
+                        path: path.clone(),
                         source,
                     })?;
                 }
                 Ok(_) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(source) => {
-                    return Err(PrefixError::IsolateUserFolder {
-                        path: folder,
-                        source,
-                    });
+                    return Err(PrefixError::IsolateUserFolder { path, source });
                 }
             }
         }
@@ -411,7 +406,7 @@ mod tests {
         );
         write_executable(
             &wineboot,
-            "#!/bin/sh\nuser=\"$WINEPREFIX/drive_c/users/test\"\nmkdir -p \"$user/AppData\"\nln -s /tmp/host-documents \"$user/Documents\"\nln -s /tmp/host-desktop \"$user/Desktop\"\n",
+            "#!/bin/sh\nuser=\"$WINEPREFIX/drive_c/users/test\"\nmkdir -p \"$user/AppData\"\nln -s /tmp/host-documents \"$user/Documents\"\nln -s /tmp/host-desktop \"$user/Desktop\"\nln -s /tmp/host-documents \"$user/ドキュメント\"\n",
         );
         let locale = super::LocaleEnvironment {
             name: "C.UTF-8".to_owned(),
@@ -422,7 +417,7 @@ mod tests {
         super::create_prefix(&prefix, PrefixArch::Win64, &locale, &wineboot, &wine)
             .expect("create isolated prefix");
 
-        for folder in ["Documents", "Desktop"] {
+        for folder in ["Documents", "Desktop", "ドキュメント"] {
             let path = prefix.join("drive_c/users/test").join(folder);
             assert!(path.is_dir());
             assert!(

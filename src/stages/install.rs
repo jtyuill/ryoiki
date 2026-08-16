@@ -104,7 +104,6 @@ impl InstallOutcome {
     }
 
     pub fn discard(&self) {
-        let _ = fs::remove_dir_all(&self.prefix);
         let _ = fs::remove_dir_all(&self.session_dir);
     }
 }
