@@ -120,6 +120,8 @@ pub struct StoredGame {
     pub metadata: GameMetadata,
     pub thumbnail: Option<Vec<u8>>,
     pub profile: Option<StoredProfile>,
+    pub playtime_seconds: i64,
+    pub last_played_at: Option<i64>,
 }
 
 #[derive(Debug, Error)]
@@ -214,6 +216,19 @@ impl LibraryStore {
         self.runtime()?.block_on(self.reorder_async(game_ids))
     }
 
+    pub fn record_session(
+        &self,
+        game_id: i64,
+        playtime_seconds: i64,
+        last_played_at: i64,
+    ) -> Result<(), LibraryError> {
+        self.runtime()?.block_on(self.record_session_async(
+            game_id,
+            playtime_seconds,
+            last_played_at,
+        ))
+    }
+
     fn runtime(&self) -> Result<tokio::runtime::Runtime, LibraryError> {
         tokio::runtime::Builder::new_current_thread()
             .build()
@@ -277,11 +292,36 @@ impl LibraryStore {
                 vndb_id TEXT,\
                 thumbnail BLOB,\
                 profile_id INTEGER UNIQUE REFERENCES launch_profiles(id),\
-                position INTEGER NOT NULL\
+                position INTEGER NOT NULL,\
+                playtime_seconds INTEGER NOT NULL DEFAULT 0,\
+                last_played_at INTEGER\
             )",
         )
         .execute(&mut connection)
         .await?;
+        let game_columns = sqlx::query("PRAGMA table_info(library_games)")
+            .fetch_all(&mut connection)
+            .await?;
+        let has_playtime_seconds = game_columns.iter().any(|row| {
+            row.try_get::<String, _>("name")
+                .is_ok_and(|name| name == "playtime_seconds")
+        });
+        if !has_playtime_seconds {
+            sqlx::query(
+                "ALTER TABLE library_games ADD COLUMN playtime_seconds INTEGER NOT NULL DEFAULT 0",
+            )
+            .execute(&mut connection)
+            .await?;
+        }
+        let has_last_played_at = game_columns.iter().any(|row| {
+            row.try_get::<String, _>("name")
+                .is_ok_and(|name| name == "last_played_at")
+        });
+        if !has_last_played_at {
+            sqlx::query("ALTER TABLE library_games ADD COLUMN last_played_at INTEGER")
+                .execute(&mut connection)
+                .await?;
+        }
         sqlx::query(
             "INSERT INTO library_games (title, vndb_id, profile_id, position) \
              SELECT profile.title, profile.vndb_id, profile.id, \
@@ -301,6 +341,7 @@ impl LibraryStore {
         let rows = sqlx::query(
             "SELECT game.id AS game_id, game.title AS game_title, game.alttitle, \
                     game.released, game.vndb_id AS game_vndb_id, game.thumbnail, \
+                    game.playtime_seconds, game.last_played_at, \
                     profile.id AS profile_id, profile.exe, profile.prefix, profile.arch, \
                     profile.runner, profile.locale, profile.disc_path, profile.disc_drive, \
                     profile.disc_kind, profile.winetricks, profile.vndb_id AS profile_vndb_id, \
@@ -342,6 +383,8 @@ impl LibraryStore {
             metadata: metadata.clone(),
             thumbnail: thumbnail.map(ToOwned::to_owned),
             profile: None,
+            playtime_seconds: 0,
+            last_played_at: None,
         })
     }
 
@@ -484,6 +527,35 @@ impl LibraryStore {
         transaction.commit().await?;
         Ok(())
     }
+
+    async fn record_session_async(
+        &self,
+        game_id: i64,
+        playtime_seconds: i64,
+        last_played_at: i64,
+    ) -> Result<(), LibraryError> {
+        let mut connection = self.connect().await?;
+        let result = sqlx::query(
+            "UPDATE library_games SET \
+                playtime_seconds = CASE \
+                    WHEN playtime_seconds > ? THEN 9223372036854775807 \
+                    ELSE playtime_seconds + ? \
+                END, \
+                last_played_at = MAX(COALESCE(last_played_at, ?), ?) \
+             WHERE id = ?",
+        )
+        .bind(i64::MAX.saturating_sub(playtime_seconds))
+        .bind(playtime_seconds)
+        .bind(last_played_at)
+        .bind(last_played_at)
+        .bind(game_id)
+        .execute(&mut connection)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(LibraryError::MissingGame { id: game_id });
+        }
+        Ok(())
+    }
 }
 
 fn decode_game(row: sqlx::sqlite::SqliteRow) -> Result<StoredGame, LibraryError> {
@@ -507,6 +579,8 @@ fn decode_game(row: sqlx::sqlite::SqliteRow) -> Result<StoredGame, LibraryError>
         },
         thumbnail: row.try_get("thumbnail")?,
         profile,
+        playtime_seconds: row.try_get("playtime_seconds")?,
+        last_played_at: row.try_get("last_played_at")?,
     })
 }
 
@@ -616,6 +690,16 @@ mod tests {
             profile
         );
 
+        store
+            .record_session(first.id, 30, 1_700_000_000)
+            .expect("record first session");
+        store
+            .record_session(first.id, 45, 1_699_999_999)
+            .expect("record second session");
+        let played = store.load().expect("load recorded sessions");
+        assert_eq!(played[1].playtime_seconds, 75);
+        assert_eq!(played[1].last_played_at, Some(1_700_000_000));
+
         let replacement = GameMetadata {
             title: "Updated".to_owned(),
             alttitle: None,
@@ -673,6 +757,21 @@ mod tests {
             .await
             .expect("create legacy schema");
             sqlx::query(
+                "CREATE TABLE library_games (
+                    id INTEGER PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    alttitle TEXT,
+                    released TEXT,
+                    vndb_id TEXT,
+                    thumbnail BLOB,
+                    profile_id INTEGER UNIQUE REFERENCES launch_profiles(id),
+                    position INTEGER NOT NULL
+                )",
+            )
+            .execute(&mut connection)
+            .await
+            .expect("create legacy library schema");
+            sqlx::query(
                 "INSERT INTO launch_profiles
                  (title, exe, prefix, arch, runner, locale, winetricks, vndb_id, notes, position)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -699,5 +798,7 @@ mod tests {
         assert_eq!(games[0].metadata.title, "Sanoba Witch");
         assert_eq!(games[0].metadata.vndb_id.as_deref(), Some("v16044"));
         assert!(games[0].profile.is_some());
+        assert_eq!(games[0].playtime_seconds, 0);
+        assert_eq!(games[0].last_played_at, None);
     }
 }

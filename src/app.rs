@@ -4,6 +4,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     thread,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use relm4::{Component, ComponentParts, ComponentSender, RelmWidgetExt, adw, adw::prelude::*, gtk};
@@ -18,7 +19,7 @@ use crate::{
             InstallError, InstallOutcome, InstallRequest, PreparedInstall, PreparedInstallSource,
             RuntimeCommands, execute_install, inspect_install_source, prepare_install_source,
         },
-        launch::{LaunchError, run_game},
+        launch::{LaunchError, launch_game},
     },
     vndb::{VnSummary, VndbClient, VndbError},
 };
@@ -93,6 +94,14 @@ struct LibraryGame {
     metadata: GameMetadata,
     profile: Option<StoredProfile>,
     thumbnail: Option<Vec<u8>>,
+    playtime_seconds: i64,
+    last_played_at: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GameSession {
+    started_at: i64,
+    playtime_seconds: i64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -144,7 +153,9 @@ pub enum AppMsg {
     },
     LaunchGame(LibraryGameId),
     GameFinished {
+        id: LibraryGameId,
         title: String,
+        session: Option<GameSession>,
         result: Result<(), LaunchError>,
     },
     ToggleLibraryEditMode,
@@ -712,9 +723,33 @@ impl Component for App {
             AppMsg::LaunchGame(id) => {
                 self.start_game(id, sender);
             }
-            AppMsg::GameFinished { title, result } => {
-                if let Err(error) = result {
-                    self.library_error = Some(format!("“{title}” stopped with an error: {error}"));
+            AppMsg::GameFinished {
+                id,
+                title,
+                session,
+                result,
+            } => {
+                let session_error = session.and_then(|session| {
+                    self.record_game_session(id, session)
+                        .err()
+                        .map(|error| error.to_string())
+                });
+                match (session_error, result.err()) {
+                    (Some(session_error), Some(launch_error)) => {
+                        self.library_error = Some(format!(
+                            "“{title}” stopped with an error: {launch_error}. Playtime was not saved: {session_error}"
+                        ));
+                    }
+                    (Some(session_error), None) => {
+                        self.library_error = Some(format!(
+                            "“{title}” finished, but its playtime was not saved: {session_error}"
+                        ));
+                    }
+                    (None, Some(launch_error)) => {
+                        self.library_error =
+                            Some(format!("“{title}” stopped with an error: {launch_error}"));
+                    }
+                    (None, None) => {}
                 }
             }
             AppMsg::ToggleLibraryEditMode => {
@@ -1339,7 +1374,11 @@ impl App {
         }
     }
 
-    fn show_executable_chooser(&mut self, root: &adw::ApplicationWindow, sender: ComponentSender<App>) {
+    fn show_executable_chooser(
+        &mut self,
+        root: &adw::ApplicationWindow,
+        sender: ComponentSender<App>,
+    ) {
         let Some(outcome) = self
             .wizard
             .as_ref()
@@ -1381,13 +1420,8 @@ impl App {
         current_folder: Option<&Path>,
         executables_only: bool,
     ) {
-        let chooser = gtk::FileChooserNative::new(
-            title,
-            Some(root),
-            action,
-            Some("Choose"),
-            Some("Cancel"),
-        );
+        let chooser =
+            gtk::FileChooserNative::new(title, Some(root), action, Some("Choose"), Some("Cancel"));
         if executables_only {
             let executables = gtk::FileFilter::new();
             executables.set_name(Some("Windows executables"));
@@ -1543,9 +1577,63 @@ impl App {
         let title = game.metadata.title.clone();
         self.library_error = None;
         thread::spawn(move || {
-            let result = run_game(&profile, &data_root, &RuntimeCommands::default());
-            sender.input(AppMsg::GameFinished { title, result });
+            let (session, result) =
+                match launch_game(&profile, &data_root, &RuntimeCommands::default()) {
+                    Ok(mut child) => {
+                        let started_at = unix_timestamp();
+                        let started = Instant::now();
+                        let result = child.wait().map_err(LaunchError::Wait).and_then(|status| {
+                            if status.success() {
+                                Ok(())
+                            } else {
+                                Err(LaunchError::Exited(status))
+                            }
+                        });
+                        let playtime_seconds =
+                            started.elapsed().as_secs().min(i64::MAX as u64) as i64;
+                        (
+                            Some(GameSession {
+                                started_at,
+                                playtime_seconds,
+                            }),
+                            result,
+                        )
+                    }
+                    Err(error) => (None, Err(error)),
+                };
+            sender.input(AppMsg::GameFinished {
+                id,
+                title,
+                session,
+                result,
+            });
         });
+    }
+
+    fn record_game_session(
+        &mut self,
+        id: LibraryGameId,
+        session: GameSession,
+    ) -> Result<(), String> {
+        let Some(store) = &self.library_store else {
+            return Err("the library database is unavailable".to_owned());
+        };
+        store
+            .record_session(id.0, session.playtime_seconds, session.started_at)
+            .map_err(|error| error.to_string())?;
+        let Some(game) = self.games.iter_mut().find(|game| game.id == id) else {
+            return Err("the game is no longer in the library".to_owned());
+        };
+        game.playtime_seconds = game
+            .playtime_seconds
+            .saturating_add(session.playtime_seconds);
+        game.last_played_at = Some(
+            game.last_played_at
+                .unwrap_or(i64::MIN)
+                .max(session.started_at),
+        );
+        self.refresh_games_list();
+        Ok(())
     }
 
     fn start_removing_game(
@@ -1726,6 +1814,13 @@ fn set_path_choices(dropdown: &gtk::DropDown, paths: &[PathBuf]) {
 fn selected_path(paths: &[PathBuf], dropdown: &gtk::DropDown) -> Option<PathBuf> {
     paths.get(dropdown.selected() as usize).cloned()
 }
+
+fn unix_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
+        .unwrap_or(0)
+}
 fn remove_stored_game(
     store: &LibraryStore,
     id: LibraryGameId,
@@ -1814,6 +1909,8 @@ fn library_game_from_stored(stored: StoredGame) -> LibraryGame {
         metadata: stored.metadata,
         profile: stored.profile,
         thumbnail: stored.thumbnail,
+        playtime_seconds: stored.playtime_seconds,
+        last_played_at: stored.last_played_at,
     }
 }
 
@@ -2027,7 +2124,6 @@ fn show_remove_game_confirmation(
     window.present();
 }
 
-
 fn show_local_source_prompt(root: &adw::ApplicationWindow, sender: ComponentSender<App>) {
     let window = gtk::Window::builder()
         .transient_for(root)
@@ -2078,7 +2174,6 @@ fn show_local_source_prompt(root: &adw::ApplicationWindow, sender: ComponentSend
     window.set_child(Some(&content));
     window.present();
 }
-
 
 async fn search_with_thumbnails(
     client: VndbClient,
@@ -2141,6 +2236,13 @@ fn build_game_card(
     title.set_valign(gtk::Align::Start);
     title.set_yalign(0.5);
     card.append(&title);
+
+    let activity = gtk::Label::new(Some(&game_activity_text(game)));
+    activity.set_xalign(0.5);
+    activity.set_justify(gtk::Justification::Center);
+    activity.set_wrap(true);
+    activity.add_css_class("dim-label");
+    card.append(&activity);
 
     if !edit_mode {
         let action = if game.profile.is_some() {
@@ -2216,6 +2318,29 @@ fn build_game_card(
     card.append(&library_card_spacer());
 
     wrap_library_card(card)
+}
+
+fn game_activity_text(game: &LibraryGame) -> String {
+    let playtime = format_playtime(game.playtime_seconds);
+    match game
+        .last_played_at
+        .and_then(|timestamp| gtk::glib::DateTime::from_unix_local(timestamp).ok())
+        .and_then(|date| date.format("%Y-%m-%d").ok())
+    {
+        Some(last_played) => format!("{playtime} · Last played {last_played}"),
+        None => format!("{playtime} · Not played yet"),
+    }
+}
+
+fn format_playtime(playtime_seconds: i64) -> String {
+    let playtime_minutes = playtime_seconds.max(0) / 60;
+    let hours = playtime_minutes / 60;
+    let minutes = playtime_minutes % 60;
+    if hours == 0 {
+        format!("Playtime: {minutes}m")
+    } else {
+        format!("Playtime: {hours}h {minutes}m")
+    }
 }
 
 fn wrap_library_card(card: gtk::Box) -> gtk::Box {
@@ -2358,7 +2483,10 @@ mod tests {
     use relm4::gtk::{self, prelude::*};
     use tempfile::tempdir;
 
-    use super::{LibraryGameId, MoveDirection, moved_index, remove_stored_game, result_subtitle};
+    use super::{
+        LibraryGameId, MoveDirection, format_playtime, moved_index, remove_stored_game,
+        result_subtitle,
+    };
 
     #[test]
     fn formats_original_title_and_release_for_result_rows() {
@@ -2371,6 +2499,14 @@ mod tests {
         };
 
         assert_eq!(result_subtitle(&entry), "原題\nv1 · 2025");
+    }
+
+    #[test]
+    fn formats_playtime_in_hours_and_minutes() {
+        assert_eq!(format_playtime(0), "Playtime: 0m");
+        assert_eq!(format_playtime(59 * 60), "Playtime: 59m");
+        assert_eq!(format_playtime(60 * 60), "Playtime: 1h 0m");
+        assert_eq!(format_playtime(125 * 60), "Playtime: 2h 5m");
     }
 
     #[test]
@@ -2400,8 +2536,9 @@ mod tests {
                 .expect("pixbuf");
         pixbuf.fill(0x3366_99ff);
         let png = pixbuf.save_to_bufferv("png", &[]).expect("encode png");
-        let texture = super::thumbnail_texture(png.clone(), super::COVER_WIDTH, super::COVER_HEIGHT)
-            .expect("decode cover");
+        let texture =
+            super::thumbnail_texture(png.clone(), super::COVER_WIDTH, super::COVER_HEIGHT)
+                .expect("decode cover");
         assert_eq!(texture.width(), super::COVER_WIDTH);
         assert_eq!(texture.height(), super::COVER_HEIGHT);
 

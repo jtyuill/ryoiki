@@ -283,10 +283,11 @@ fn isolate_user_folders(prefix: &Path) -> Result<(), PrefixError> {
             continue;
         }
 
-        let folders = fs::read_dir(entry.path()).map_err(|source| PrefixError::IsolateUserFolder {
-            path: entry.path(),
-            source,
-        })?;
+        let folders =
+            fs::read_dir(entry.path()).map_err(|source| PrefixError::IsolateUserFolder {
+                path: entry.path(),
+                source,
+            })?;
         for folder in folders {
             let folder = folder.map_err(|source| PrefixError::IsolateUserFolder {
                 path: entry.path(),
